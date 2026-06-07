@@ -32,15 +32,19 @@ use codex_core::{
     review_prompts::user_facing_hint,
 };
 use codex_login::auth::AuthManager;
-use codex_models_manager::manager::{ModelsManager, RefreshStrategy};
+use codex_models_manager::{
+    collaboration_mode_presets::builtin_collaboration_mode_presets,
+    manager::{ModelsManager, RefreshStrategy},
+};
 use codex_protocol::{
     approvals::{
         ElicitationRequest, ElicitationRequestEvent, GuardianAssessmentAction,
         GuardianCommandSource,
     },
-    config_types::TrustLevel,
+    config_types::{CollaborationMode, ModeKind, Settings, TrustLevel},
     dynamic_tools::{DynamicToolCallOutputContentItem, DynamicToolCallRequest},
     error::CodexErr,
+    items::TurnItem,
     mcp::CallToolResult,
     models::{
         ActivePermissionProfile, AdditionalPermissionProfile, PermissionProfile, ResponseItem,
@@ -116,6 +120,7 @@ const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
 const CODEX_READ_ONLY_PROFILE_ID: &str = ":read-only";
 const CODEX_WORKSPACE_PROFILE_ID: &str = ":workspace";
 const CODEX_DANGER_NO_SANDBOX_PROFILE_ID: &str = ":danger-no-sandbox";
+const PLAN_MODE_ID: &str = "plan";
 
 fn session_mode_id_for_active_profile(profile_id: &str) -> Option<&'static str> {
     match profile_id {
@@ -859,6 +864,7 @@ struct PromptState {
     response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
     seen_message_deltas: bool,
     seen_reasoning_deltas: bool,
+    plan_text_by_item: HashMap<String, String>,
 }
 
 impl PromptState {
@@ -882,6 +888,7 @@ impl PromptState {
             response_tx: Some(response_tx),
             seen_message_deltas: false,
             seen_reasoning_deltas: false,
+            plan_text_by_item: HashMap::new(),
         }
     }
 
@@ -1207,6 +1214,14 @@ impl PromptState {
                 info!("Agent plan updated. Explanation: {:?}", explanation);
                 client.update_plan(plan);
             }
+            EventMsg::PlanDelta(event) => {
+                let plan_text = self
+                    .plan_text_by_item
+                    .entry(event.item_id)
+                    .or_default();
+                plan_text.push_str(&event.delta);
+                client.update_plan_text(plan_text, PlanEntryStatus::InProgress);
+            }
             EventMsg::WebSearchBegin(WebSearchBeginEvent { call_id }) => {
                 info!("Web search started: call_id={}", call_id);
                 // Create a ToolCall notification for the search beginning
@@ -1347,6 +1362,17 @@ impl PromptState {
                 completed_at_ms: _,
             }) => {
                 info!("Item completed: thread_id={}, turn_id={}, item={:?}", thread_id, turn_id, item);
+                if let TurnItem::Plan(plan) = item {
+                    let plan_text = if plan.text.trim().is_empty() {
+                        self.plan_text_by_item
+                            .remove(&plan.id)
+                            .unwrap_or_default()
+                    } else {
+                        self.plan_text_by_item.remove(&plan.id);
+                        plan.text
+                    };
+                    client.update_plan_text(&plan_text, PlanEntryStatus::Completed);
+                }
             }
             EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message, turn_id, completed_at: _, duration_ms: _, time_to_first_token_ms: _, }) => {
                 info!(
@@ -1497,8 +1523,7 @@ impl PromptState {
             | EventMsg::CollabResumeBegin(..)
             | EventMsg::CollabResumeEnd(..)
             | EventMsg::CollabCloseBegin(..)
-            | EventMsg::CollabCloseEnd(..)
-            | EventMsg::PlanDelta(..)=> {}
+            | EventMsg::CollabCloseEnd(..) => {}
             e @ (EventMsg::RealtimeConversationListVoicesResponse(..)
             | EventMsg::DeprecationNotice(..)
             | EventMsg::RequestUserInput(..)) => {
@@ -2706,7 +2731,7 @@ impl SessionClient {
     }
 
     fn update_plan(&self, plan: Vec<PlanItemArg>) {
-        self.send_notification(SessionUpdate::Plan(Plan::new(
+        self.update_plan_entries(
             plan.into_iter()
                 .map(|entry| {
                     PlanEntry::new(
@@ -2720,7 +2745,23 @@ impl SessionClient {
                     )
                 })
                 .collect(),
-        )));
+        );
+    }
+
+    fn update_plan_text(&self, plan_text: impl AsRef<str>, status: PlanEntryStatus) {
+        let plan_text = plan_text.as_ref().trim();
+        if plan_text.is_empty() {
+            return;
+        }
+        self.update_plan_entries(vec![PlanEntry::new(
+            plan_text.to_string(),
+            PlanEntryPriority::Medium,
+            status,
+        )]);
+    }
+
+    fn update_plan_entries(&self, entries: Vec<PlanEntry>) {
+        self.send_notification(SessionUpdate::Plan(Plan::new(entries)));
     }
 
     async fn request_permission(
@@ -2759,6 +2800,8 @@ struct ThreadActor<A> {
     resolution_rx: mpsc::UnboundedReceiver<ThreadMessage>,
     /// Last config options state we emitted to the client, used for deduping updates.
     last_sent_config_options: Option<Vec<SessionConfigOption>>,
+    /// Tracks the collaboration mode exposed through ACP session modes.
+    current_collaboration_mode: ModeKind,
 }
 
 impl<A: Auth> ThreadActor<A> {
@@ -2784,6 +2827,7 @@ impl<A: Auth> ThreadActor<A> {
             message_rx,
             resolution_rx,
             last_sent_config_options: None,
+            current_collaboration_mode: ModeKind::Default,
         }
     }
 
@@ -2934,17 +2978,47 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     fn modes(&self) -> Option<SessionModeState> {
-        let current_mode_id = current_session_mode_id(&self.config)?;
+        let current_mode_id = if self.current_collaboration_mode == ModeKind::Plan {
+            SessionModeId::new(PLAN_MODE_ID)
+        } else {
+            current_session_mode_id(&self.config)?
+        };
 
-        Some(SessionModeState::new(
-            current_mode_id,
-            APPROVAL_PRESETS
-                .iter()
-                .map(|preset| {
-                    SessionMode::new(preset.id, preset.label).description(preset.description)
-                })
-                .collect(),
-        ))
+        let mut available_modes = APPROVAL_PRESETS
+            .iter()
+            .map(|preset| SessionMode::new(preset.id, preset.label).description(preset.description))
+            .collect::<Vec<_>>();
+        available_modes.push(
+            SessionMode::new(PLAN_MODE_ID, "Plan").description(
+                "Plan the work, ask clarifying questions, and avoid making code changes",
+            ),
+        );
+
+        Some(SessionModeState::new(current_mode_id, available_modes))
+    }
+
+    async fn collaboration_mode_for_kind(&self, kind: ModeKind) -> CollaborationMode {
+        let base = CollaborationMode {
+            mode: self.current_collaboration_mode,
+            settings: Settings {
+                model: self.get_current_model().await,
+                reasoning_effort: self.config.model_reasoning_effort,
+                developer_instructions: None,
+            },
+        };
+
+        let mut mask = builtin_collaboration_mode_presets()
+            .into_iter()
+            .find(|mask| mask.mode == Some(kind))
+            .expect("Codex should ship Default and Plan collaboration mode presets");
+
+        if kind == ModeKind::Plan
+            && let Some(effort) = self.config.plan_mode_reasoning_effort
+        {
+            mask.reasoning_effort = Some(Some(effort));
+        }
+
+        base.apply_mask(&mask)
     }
 
     async fn config_options(&self) -> Result<Vec<SessionConfigOption>, Error> {
@@ -3282,10 +3356,31 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn handle_set_mode(&mut self, mode: SessionModeId) -> Result<(), Error> {
+        if mode.0.as_ref() == PLAN_MODE_ID {
+            let collaboration_mode = self.collaboration_mode_for_kind(ModeKind::Plan).await;
+            self.thread
+                .submit(Op::ThreadSettings {
+                    thread_settings: ThreadSettingsOverrides {
+                        collaboration_mode: Some(collaboration_mode),
+                        ..Default::default()
+                    },
+                })
+                .await
+                .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+            self.current_collaboration_mode = ModeKind::Plan;
+            return Ok(());
+        }
+
         let preset = APPROVAL_PRESETS
             .iter()
             .find(|preset| mode.0.as_ref() == preset.id)
             .ok_or_else(Error::invalid_params)?;
+
+        let collaboration_mode = self
+            .collaboration_mode_for_kind(ModeKind::Default)
+            .await
+            .with_updates(None, None, None);
 
         self.thread
             .submit(Op::ThreadSettings {
@@ -3294,6 +3389,7 @@ impl<A: Auth> ThreadActor<A> {
                     permission_profile: Some(preset.permission_profile.clone()),
                     active_permission_profile: active_profile_id_for_session_mode(preset.id)
                         .map(ActivePermissionProfile::new),
+                    collaboration_mode: Some(collaboration_mode),
                     ..Default::default()
                 },
             })
@@ -3317,6 +3413,8 @@ impl<A: Auth> ThreadActor<A> {
                 TrustLevel::Trusted,
             )?;
         }
+
+        self.current_collaboration_mode = ModeKind::Default;
 
         Ok(())
     }
@@ -4363,6 +4461,98 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn load_advertises_plan_mode() -> anyhow::Result<()> {
+        let (_session_id, _client, _thread, message_tx, _handle) = setup().await?;
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Load { response_tx })?;
+
+        let response = response_rx.await??;
+        let modes = response.modes.expect("load should include modes");
+        assert!(
+            modes
+                .available_modes
+                .iter()
+                .any(|mode| mode.id.0.as_ref() == PLAN_MODE_ID)
+        );
+        drop(message_tx);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn set_plan_mode_applies_codex_plan_collaboration_mode() -> anyhow::Result<()> {
+        let (_session_id, _client, thread, message_tx, _handle) = setup().await?;
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::SetMode {
+            mode: SessionModeId::new(PLAN_MODE_ID),
+            response_tx,
+        })?;
+
+        response_rx.await??;
+        drop(message_tx);
+
+        let ops = thread.ops.lock().unwrap();
+        let [Op::ThreadSettings { thread_settings }] = ops.as_slice() else {
+            panic!("expected one ThreadSettings op, got {ops:#?}");
+        };
+        let collaboration_mode = thread_settings
+            .collaboration_mode
+            .as_ref()
+            .expect("plan mode should submit collaboration mode");
+        assert_eq!(collaboration_mode.mode, ModeKind::Plan);
+        assert!(collaboration_mode.settings.reasoning_effort.is_some());
+        let instructions = collaboration_mode
+            .settings
+            .developer_instructions
+            .as_deref()
+            .expect("plan mode should include developer instructions");
+        assert!(instructions.contains("Plan Mode"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn approval_mode_restores_default_collaboration_mode() -> anyhow::Result<()> {
+        let (_session_id, _client, thread, message_tx, _handle) = setup().await?;
+        let (plan_response_tx, plan_response_rx) = tokio::sync::oneshot::channel();
+        message_tx.send(ThreadMessage::SetMode {
+            mode: SessionModeId::new(PLAN_MODE_ID),
+            response_tx: plan_response_tx,
+        })?;
+        plan_response_rx.await??;
+
+        let (auto_response_tx, auto_response_rx) = tokio::sync::oneshot::channel();
+        message_tx.send(ThreadMessage::SetMode {
+            mode: SessionModeId::new("auto"),
+            response_tx: auto_response_tx,
+        })?;
+        auto_response_rx.await??;
+        drop(message_tx);
+
+        let ops = thread.ops.lock().unwrap();
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(
+            &ops[1],
+            Op::ThreadSettings {
+                thread_settings: ThreadSettingsOverrides {
+                    collaboration_mode: Some(CollaborationMode {
+                        mode: ModeKind::Default,
+                        settings: Settings {
+                            developer_instructions: Some(instructions),
+                            ..
+                        },
+                    }),
+                    ..
+                },
+            } if instructions.contains("<collaboration_mode>")
+        ));
+
+        Ok(())
+    }
+
     #[test]
     fn read_only_mode_does_not_trust_project() {
         assert!(!mode_trusts_project("read-only"));
@@ -5020,6 +5210,7 @@ mod tests {
                     | Op::ResolveElicitation { .. }
                     | Op::RequestPermissionsResponse { .. }
                     | Op::PatchApproval { .. }
+                    | Op::ThreadSettings { .. }
                     | Op::Interrupt => {}
                     Op::Shutdown => {
                         if let Some(active_prompt_id) = self.active_prompt_id.lock().unwrap().take()
