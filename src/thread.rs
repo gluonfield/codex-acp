@@ -78,6 +78,7 @@ use codex_protocol::{
         PermissionGrantScope, RequestPermissionProfile, RequestPermissionsEvent,
         RequestPermissionsResponse,
     },
+    request_user_input::RequestUserInputResponse,
     user_input::UserInput,
 };
 use codex_shell_command::parse_command::parse_command;
@@ -121,6 +122,10 @@ const CODEX_READ_ONLY_PROFILE_ID: &str = ":read-only";
 const CODEX_WORKSPACE_PROFILE_ID: &str = ":workspace";
 const CODEX_DANGER_NO_SANDBOX_PROFILE_ID: &str = ":danger-no-sandbox";
 const PLAN_MODE_ID: &str = "plan";
+const CODEX_REQUEST_USER_INPUT_META_KEY: &str = "jaz.codex_request_user_input";
+const USER_INPUT_RESPONSE_OPTION_PREFIX: &str = "__jaz_user_input_response__:";
+const USER_INPUT_SUBMIT_OPTION_ID: &str = "__jaz_user_input_submit__";
+const USER_INPUT_CANCEL_OPTION_ID: &str = "__jaz_user_input_cancel__";
 
 fn session_mode_id_for_active_profile(profile_id: &str) -> Option<&'static str> {
     match profile_id {
@@ -500,6 +505,9 @@ enum PendingPermissionRequest {
         request_id: codex_protocol::mcp::RequestId,
         option_map: HashMap<String, ResolvedMcpElicitation>,
     },
+    UserInput {
+        turn_id: String,
+    },
 }
 
 struct PendingPermissionInteraction {
@@ -557,6 +565,26 @@ fn mcp_elicitation_request_key(
     request_id: &codex_protocol::mcp::RequestId,
 ) -> String {
     format!("mcp-elicitation:{server_name}:{request_id}")
+}
+
+fn user_input_request_key(turn_id: &str, call_id: &str) -> String {
+    format!("user-input:{turn_id}:{call_id}")
+}
+
+fn empty_user_input_response() -> RequestUserInputResponse {
+    RequestUserInputResponse {
+        answers: HashMap::new(),
+    }
+}
+
+fn decode_user_input_response_option(option_id: &str) -> RequestUserInputResponse {
+    let Some(raw_response) = option_id.strip_prefix(USER_INPUT_RESPONSE_OPTION_PREFIX) else {
+        return empty_user_input_response();
+    };
+    serde_json::from_str(raw_response).unwrap_or_else(|err| {
+        warn!("Failed to decode request_user_input response from ACP option id: {err}");
+        empty_user_input_response()
+    })
 }
 
 const MCP_TOOL_APPROVAL_KIND_KEY: &str = "codex_approval_kind";
@@ -1099,6 +1127,23 @@ impl PromptState {
                     .await
                     .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
             }
+            PendingPermissionRequest::UserInput { turn_id } => {
+                let response = match response.outcome {
+                    RequestPermissionOutcome::Selected(SelectedPermissionOutcome {
+                        option_id,
+                        ..
+                    }) => decode_user_input_response_option(option_id.0.as_ref()),
+                    RequestPermissionOutcome::Cancelled | _ => empty_user_input_response(),
+                };
+
+                self.thread
+                    .submit(Op::UserInputAnswer {
+                        id: turn_id,
+                        response,
+                    })
+                    .await
+                    .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+            }
         }
 
         Ok(())
@@ -1538,12 +1583,90 @@ impl PromptState {
             | EventMsg::CollabResumeEnd(..)
             | EventMsg::CollabCloseBegin(..)
             | EventMsg::CollabCloseEnd(..) => {}
+            EventMsg::RequestUserInput(event) => {
+                info!("Request user input: {} {}", event.call_id, event.turn_id);
+                if let Err(err) = self.request_user_input(client, event)
+                    && let Some(response_tx) = self.response_tx.take()
+                {
+                    drop(response_tx.send(Err(err)));
+                }
+            }
             e @ (EventMsg::RealtimeConversationListVoicesResponse(..)
-            | EventMsg::DeprecationNotice(..)
-            | EventMsg::RequestUserInput(..)) => {
+            | EventMsg::DeprecationNotice(..)) => {
                 warn!("Unexpected event: {:?}", e);
             }
         }
+    }
+
+    fn request_user_input(
+        &mut self,
+        client: &SessionClient,
+        event: codex_protocol::protocol::RequestUserInputEvent,
+    ) -> Result<(), Error> {
+        let request_key = user_input_request_key(&event.turn_id, &event.call_id);
+        let turn_id = event.turn_id.clone();
+        let tool_call_id = ToolCallId::new(format!("request-user-input-{}", event.call_id));
+        let title = match event.questions.as_slice() {
+            [question] => question.question.clone(),
+            [] => "Clarifying questions".to_string(),
+            questions => format!("{} clarifying questions", questions.len()),
+        };
+        let content = event
+            .questions
+            .iter()
+            .enumerate()
+            .map(|(index, question)| {
+                let mut section = format!("{}. {}", index + 1, question.question);
+                if let Some(options) = &question.options {
+                    for option in options {
+                        section.push_str(&format!(
+                            "\n- {}: {}",
+                            option.label, option.description
+                        ));
+                    }
+                }
+                section
+            })
+            .join("\n\n");
+
+        let mut meta = Meta::new();
+        meta.insert(
+            CODEX_REQUEST_USER_INPUT_META_KEY.to_string(),
+            serde_json::to_value(&event).map_err(|err| Error::from(anyhow::anyhow!(err)))?,
+        );
+
+        let tool_call = ToolCallUpdate::new(
+            tool_call_id,
+            ToolCallUpdateFields::new()
+                .kind(ToolKind::Other)
+                .status(ToolCallStatus::Pending)
+                .title(title)
+                .content(vec![ToolCallContent::Content(Content::new(
+                    ContentBlock::Text(TextContent::new(content)),
+                ))])
+                .raw_input(serde_json::to_value(&event).ok()),
+        )
+        .meta(meta);
+
+        self.spawn_permission_request(
+            client,
+            request_key,
+            PendingPermissionRequest::UserInput { turn_id },
+            tool_call,
+            vec![
+                PermissionOption::new(
+                    USER_INPUT_SUBMIT_OPTION_ID,
+                    "Submit answers",
+                    PermissionOptionKind::AllowOnce,
+                ),
+                PermissionOption::new(
+                    USER_INPUT_CANCEL_OPTION_ID,
+                    "Cancel",
+                    PermissionOptionKind::RejectOnce,
+                ),
+            ],
+        );
+        Ok(())
     }
 
     async fn mcp_elicitation(
