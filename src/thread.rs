@@ -90,6 +90,8 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use crate::developer_instructions::append_developer_instructions;
+
 /// Abstraction over the ACP connection for sending notifications and requests
 /// back to the client. This replaces the old `Client` trait usage.
 trait ClientSender: Send + Sync + 'static {
@@ -1181,10 +1183,15 @@ impl PromptState {
                 if let Some(info) = info
                     && let Some(size) = info.model_context_window {
                         let used = info.last_token_usage.tokens_in_context_window().max(0) as u64;
-                        client.send_notification(SessionUpdate::UsageUpdate(UsageUpdate::new(
-                            used,
-                            size as u64,
-                        )));
+                        let mut update = UsageUpdate::new(used, size as u64);
+                        // ACP has no first-class token components yet; relay
+                        // the last request's breakdown for clients that track
+                        // input/output/cached usage.
+                        if let Ok(last) = serde_json::to_value(&info.last_token_usage) {
+                            update.meta =
+                                Some(Meta::from_iter([("lastTokenUsage".to_string(), last)]));
+                        }
+                        client.send_notification(SessionUpdate::UsageUpdate(update));
                     }
             }
             EventMsg::ItemStarted(ItemStartedEvent { thread_id, turn_id, item , started_at_ms: _}) => {
@@ -1605,10 +1612,7 @@ impl PromptState {
                 let mut section = format!("{}. {}", index + 1, question.question);
                 if let Some(options) = &question.options {
                     for option in options {
-                        section.push_str(&format!(
-                            "\n- {}: {}",
-                            option.label, option.description
-                        ));
+                        section.push_str(&format!("\n- {}: {}", option.label, option.description));
                     }
                 }
                 section
@@ -3141,7 +3145,15 @@ impl<A: Auth> ThreadActor<A> {
             mask.reasoning_effort = Some(Some(effort));
         }
 
-        base.apply_mask(&mask)
+        let mut collaboration_mode = base.apply_mask(&mask);
+        if let Some(instructions) = self.config.developer_instructions.as_deref() {
+            collaboration_mode.settings.developer_instructions = append_developer_instructions(
+                collaboration_mode.settings.developer_instructions.take(),
+                instructions,
+            );
+        }
+
+        collaboration_mode
     }
 
     async fn config_options(&self) -> Result<Vec<SessionConfigOption>, Error> {
@@ -4606,7 +4618,9 @@ mod tests {
 
     #[tokio::test]
     async fn set_plan_mode_applies_codex_plan_collaboration_mode() -> anyhow::Result<()> {
-        let (_session_id, _client, thread, message_tx, _handle) = setup().await?;
+        let mut config = test_config().await?;
+        config.developer_instructions = Some(ACP_APPEND_TEST_INSTRUCTIONS.to_string());
+        let (_session_id, _client, thread, message_tx, _handle) = setup_with_config(config).await?;
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ThreadMessage::SetMode {
@@ -4633,13 +4647,16 @@ mod tests {
             .as_deref()
             .expect("plan mode should include developer instructions");
         assert!(instructions.contains("Plan Mode"));
+        assert!(instructions.contains(ACP_APPEND_TEST_INSTRUCTIONS));
 
         Ok(())
     }
 
     #[tokio::test]
     async fn approval_mode_restores_default_collaboration_mode() -> anyhow::Result<()> {
-        let (_session_id, _client, thread, message_tx, _handle) = setup().await?;
+        let mut config = test_config().await?;
+        config.developer_instructions = Some(ACP_APPEND_TEST_INSTRUCTIONS.to_string());
+        let (_session_id, _client, thread, message_tx, _handle) = setup_with_config(config).await?;
         let (plan_response_tx, plan_response_rx) = tokio::sync::oneshot::channel();
         message_tx.send(ThreadMessage::SetMode {
             mode: SessionModeId::new(PLAN_MODE_ID),
@@ -4671,6 +4688,7 @@ mod tests {
                     ..
                 },
             } if instructions.contains("<collaboration_mode>")
+                && instructions.contains(ACP_APPEND_TEST_INSTRUCTIONS)
         ));
 
         Ok(())
@@ -4946,7 +4964,29 @@ mod tests {
         Ok(())
     }
 
+    const ACP_APPEND_TEST_INSTRUCTIONS: &str = "Remember the ACP session context.";
+
+    async fn test_config() -> anyhow::Result<Config> {
+        Ok(Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?)
+    }
+
     async fn setup() -> anyhow::Result<(
+        SessionId,
+        Arc<StubClient>,
+        Arc<StubCodexThread>,
+        UnboundedSender<ThreadMessage>,
+        tokio::task::JoinHandle<()>,
+    )> {
+        setup_with_config(test_config().await?).await
+    }
+
+    async fn setup_with_config(
+        config: Config,
+    ) -> anyhow::Result<(
         SessionId,
         Arc<StubClient>,
         Arc<StubCodexThread>,
@@ -4959,11 +4999,6 @@ mod tests {
             SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
         let conversation = Arc::new(StubCodexThread::new());
         let models_manager = Arc::new(StubModelsManager);
-        let config = Config::load_with_cli_overrides_and_harness_overrides(
-            vec![],
-            ConfigOverrides::default(),
-        )
-        .await?;
         let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
         let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
 

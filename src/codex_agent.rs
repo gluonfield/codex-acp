@@ -4,7 +4,7 @@ use acp::schema::{
     ClientCapabilities, CloseSessionRequest, CloseSessionResponse, Implementation,
     InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
     LoadSessionRequest, LoadSessionResponse, LogoutCapabilities, LogoutRequest, LogoutResponse,
-    McpCapabilities, McpServer, McpServerHttp, McpServerStdio, NewSessionRequest,
+    McpCapabilities, McpServer, McpServerHttp, McpServerStdio, Meta, NewSessionRequest,
     NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion,
     ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionCloseCapabilities,
     SessionId, SessionInfo, SessionListCapabilities, SessionResumeCapabilities,
@@ -40,6 +40,7 @@ use std::{
 use tracing::{debug, info};
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::developer_instructions::apply_session_meta_developer_instructions;
 use crate::thread::Thread;
 
 /// The Codex implementation of the ACP Agent.
@@ -560,11 +561,15 @@ impl CodexAgent {
         self.check_auth().await?;
 
         let NewSessionRequest {
-            cwd, mcp_servers, ..
+            cwd,
+            mcp_servers,
+            meta,
+            ..
         } = request;
         info!("Creating new session with cwd: {}", cwd.display());
 
-        let config = self.build_session_config(&cwd, mcp_servers)?;
+        let mut config = self.build_session_config(&cwd, mcp_servers)?;
+        apply_session_meta_developer_instructions(&mut config, meta.as_ref());
         let num_mcp_servers = config.mcp_servers.len();
 
         let NewThread {
@@ -617,10 +622,11 @@ impl CodexAgent {
             session_id,
             cwd,
             mcp_servers,
+            meta,
             ..
         } = request;
 
-        self.restore_session(session_id, cwd, mcp_servers, cx, true)
+        self.restore_session(session_id, cwd, mcp_servers, meta, cx, true)
             .await
     }
 
@@ -637,11 +643,12 @@ impl CodexAgent {
             session_id,
             cwd,
             mcp_servers,
+            meta,
             ..
         } = request;
 
         let load = self
-            .restore_session(session_id, cwd, mcp_servers, cx, false)
+            .restore_session(session_id, cwd, mcp_servers, meta, cx, false)
             .await?;
 
         Ok(ResumeSessionResponse::new()
@@ -654,6 +661,7 @@ impl CodexAgent {
         session_id: SessionId,
         cwd: PathBuf,
         mcp_servers: Vec<McpServer>,
+        meta: Option<Meta>,
         cx: ConnectionTo<Client>,
         replay_history: bool,
     ) -> Result<LoadSessionResponse, Error> {
@@ -680,7 +688,8 @@ impl CodexAgent {
             Vec::new()
         };
 
-        let config = self.build_session_config(&cwd, mcp_servers)?;
+        let mut config = self.build_session_config(&cwd, mcp_servers)?;
+        apply_session_meta_developer_instructions(&mut config, meta.as_ref());
 
         let NewThread {
             thread_id: _,
