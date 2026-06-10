@@ -125,9 +125,9 @@ const CODEX_WORKSPACE_PROFILE_ID: &str = ":workspace";
 const CODEX_DANGER_NO_SANDBOX_PROFILE_ID: &str = ":danger-no-sandbox";
 const PLAN_MODE_ID: &str = "plan";
 const CODEX_REQUEST_USER_INPUT_META_KEY: &str = "codex.request_user_input";
-const USER_INPUT_RESPONSE_OPTION_PREFIX: &str = "__codex_user_input_response__:";
-const USER_INPUT_SUBMIT_OPTION_ID: &str = "__codex_user_input_submit__";
-const USER_INPUT_CANCEL_OPTION_ID: &str = "__codex_user_input_cancel__";
+const USER_INPUT_RESPONSE_OPTION_PREFIX: &str = "__user_input_response__:";
+const USER_INPUT_SUBMIT_OPTION_ID: &str = "__user_input_submit__";
+const USER_INPUT_CANCEL_OPTION_ID: &str = "__user_input_cancel__";
 
 fn session_mode_id_for_active_profile(profile_id: &str) -> Option<&'static str> {
     match profile_id {
