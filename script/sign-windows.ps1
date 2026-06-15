@@ -114,5 +114,6 @@ if ($canCodeSign) {
         Set-PSDebug -Off
     }
 } else {
-    exit 1
+    Write-Host "Skipping Windows signing."
+    exit 0
 }

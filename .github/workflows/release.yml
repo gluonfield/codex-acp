@@ -337,11 +337,11 @@ jobs:
     name: Publish NPM Platform Packages
     needs: [get-version, npm-packages]
     runs-on: ubuntu-latest
-    if: ${{ !github.event.repository.fork }}
-    environment: release # Optional: for enhanced security
     permissions:
       contents: read
       id-token: write
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
     steps:
       - name: Setup Node.js
@@ -364,7 +364,7 @@ jobs:
             if [ -d "$pkg" ]; then
               echo "Publishing $(basename $pkg)..."
               cd "$pkg"
-              npm publish
+              npm publish --access public
               cd ../..
             fi
           done
@@ -373,11 +373,11 @@ jobs:
     name: Publish NPM Base Package
     needs: [get-version, npm-packages, publish-npm-platform]
     runs-on: ubuntu-latest
-    if: ${{ !github.event.repository.fork }}
-    environment: release # Optional: for enhanced security
     permissions:
       contents: read
       id-token: write
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
     steps:
       - name: Setup Node.js
@@ -402,7 +402,7 @@ jobs:
       - name: Publish base package
         run: |
           cd npm
-          npm publish
+          npm publish --access public
 
   create-release:
     name: Create Release

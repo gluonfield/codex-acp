@@ -3,6 +3,9 @@
   "version": "${VERSION}",
   "description": "An ACP-compatible coding agent powered by Codex - ${OS} ${ARCH} binary",
   "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public"
+  },
   "author": "Jaz <hello@jaz.chat>",
   "homepage": "https://github.com/gluonfield/codex-acp",
   "repository": {

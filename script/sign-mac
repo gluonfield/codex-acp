@@ -19,13 +19,13 @@ IDENTITY="Zed Industries, Inc."
 echo "Code signing binary at $binary_path"
 
 if [[ -z "${MACOS_CERTIFICATE:-}" || -z "${MACOS_CERTIFICATE_PASSWORD:-}" || -z "${APPLE_NOTARIZATION_KEY:-}" || -z "${APPLE_NOTARIZATION_KEY_ID:-}" || -z "${APPLE_NOTARIZATION_ISSUER_ID:-}" ]]; then
-    echo "Error: One or more required variables are missing:"
+    echo "Skipping macOS signing; one or more required variables are missing:"
     echo "  - MACOS_CERTIFICATE"
     echo "  - MACOS_CERTIFICATE_PASSWORD"
     echo "  - APPLE_NOTARIZATION_KEY"
     echo "  - APPLE_NOTARIZATION_KEY_ID"
     echo "  - APPLE_NOTARIZATION_ISSUER_ID"
-    exit 1
+    exit 0
 fi
 
 echo "Setting up keychain for code signing..."
