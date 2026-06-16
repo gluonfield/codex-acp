@@ -34,8 +34,6 @@
     "@jazchat/codex-acp-darwin-arm64": "0.16.1",
     "@jazchat/codex-acp-darwin-x64": "0.16.1",
     "@jazchat/codex-acp-linux-arm64": "0.16.1",
-    "@jazchat/codex-acp-linux-x64": "0.16.1",
-    "@jazchat/codex-acp-win32-arm64": "0.16.1",
-    "@jazchat/codex-acp-win32-x64": "0.16.1"
+    "@jazchat/codex-acp-linux-x64": "0.16.1"
   }
 }
