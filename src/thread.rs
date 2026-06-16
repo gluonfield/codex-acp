@@ -129,6 +129,9 @@ const USER_INPUT_RESPONSE_OPTION_PREFIX: &str = "__user_input_response__:";
 const USER_INPUT_SUBMIT_OPTION_ID: &str = "__user_input_submit__";
 const USER_INPUT_CANCEL_OPTION_ID: &str = "__user_input_cancel__";
 
+const ACP_TOOL_TEXT_BYTE_LIMIT: usize = 256 * 1024;
+const ACP_TOOL_RAW_JSON_BYTE_LIMIT: usize = 256 * 1024;
+
 fn session_mode_id_for_active_profile(profile_id: &str) -> Option<&'static str> {
     match profile_id {
         CODEX_READ_ONLY_PROFILE_ID => Some("read-only"),
@@ -876,7 +879,6 @@ impl SubmissionState {
 struct ActiveCommand {
     tool_call_id: ToolCallId,
     terminal_output: bool,
-    output: String,
     file_extension: Option<String>,
 }
 
@@ -2030,7 +2032,6 @@ impl PromptState {
             ActiveCommand {
                 terminal_output,
                 tool_call_id: tool_call_id.clone(),
-                output: String::new(),
                 file_extension,
             },
         );
@@ -2140,7 +2141,6 @@ impl PromptState {
 
         let active_command = ActiveCommand {
             tool_call_id: tool_call_id.clone(),
-            output: String::new(),
             file_extension,
             terminal_output,
         };
@@ -2182,10 +2182,9 @@ impl PromptState {
             stream: _,
         } = event;
         // Stream output bytes to the display-only terminal via ToolCallUpdate meta.
-        if let Some(active_command) = self.active_commands.get_mut(&call_id) {
-            let data_str = String::from_utf8_lossy(&chunk).to_string();
-
+        if let Some(active_command) = self.active_commands.get(&call_id) {
             if client.supports_terminal_output(active_command) {
+                let data_str = acp_safe_text(String::from_utf8_lossy(&chunk).to_string());
                 let update = ToolCallUpdate::new(
                     active_command.tool_call_id.clone(),
                     ToolCallUpdateFields::new(),
@@ -2198,18 +2197,11 @@ impl PromptState {
                     }),
                 )]));
                 client.send_tool_call_update(update);
-            } else {
-                // Fallback path (no terminal_output capability): accumulate locally
-                // and emit a single ToolCallUpdate at exec_command_end. Resending the
-                // entire accumulated buffer per chunk is O(N²) memory and crashes the
-                // process on large outputs (issue #225).
-                active_command.output.push_str(&data_str);
             }
         }
     }
 
     fn exec_command_end(&mut self, client: &SessionClient, event: ExecCommandEndEvent) {
-        let raw_output = serde_json::json!(&event);
         let ExecCommandEndEvent {
             turn_id: _,
             command: _,
@@ -2223,7 +2215,7 @@ impl PromptState {
             stderr: _,
             aggregated_output: _,
             duration: _,
-            formatted_output: _,
+            formatted_output,
             process_id: _,
             completed_at_ms: _,
             status,
@@ -2239,26 +2231,18 @@ impl PromptState {
 
             let supports_terminal = client.supports_terminal_output(&active_command);
 
-            let mut fields = ToolCallUpdateFields::new()
-                .status(status)
-                .raw_output(raw_output);
+            let mut fields = ToolCallUpdateFields::new().status(status);
 
-            // For the non-terminal fallback path the per-chunk delta handler now
-            // accumulates silently (see exec_command_output_delta). Emit the full
-            // buffer here, exactly once, as a single content block. Skip the emission
-            // entirely when the command produced no output, so we don't surface an
-            // empty fenced code block to the client.
-            if !supports_terminal && !active_command.output.is_empty() {
+            if !supports_terminal && !formatted_output.is_empty() {
                 let content = match active_command.file_extension.as_deref() {
-                    Some("md") => active_command.output.clone(),
-                    Some(ext) => format!(
-                        "```{ext}\n{}\n```\n",
-                        active_command.output.trim_end_matches('\n')
-                    ),
-                    None => format!(
-                        "```sh\n{}\n```\n",
-                        active_command.output.trim_end_matches('\n')
-                    ),
+                    Some("md") => formatted_output,
+                    Some(ext) => {
+                        format!(
+                            "```{ext}\n{}\n```\n",
+                            formatted_output.trim_end_matches('\n')
+                        )
+                    }
+                    None => format!("```sh\n{}\n```\n", formatted_output.trim_end_matches('\n')),
                 };
                 fields = fields.content(vec![content.into()]);
             }
@@ -2287,9 +2271,9 @@ impl PromptState {
             stdin,
         } = event;
 
-        let stdin = format!("\n{stdin}\n");
+        let stdin = acp_safe_text(format!("\n{stdin}\n"));
         // Stream output bytes to the display-only terminal via ToolCallUpdate meta.
-        if let Some(active_command) = self.active_commands.get_mut(&call_id) {
+        if let Some(active_command) = self.active_commands.get(&call_id) {
             if client.supports_terminal_output(active_command) {
                 let update = ToolCallUpdate::new(
                     active_command.tool_call_id.clone(),
@@ -2303,12 +2287,6 @@ impl PromptState {
                     }),
                 )]));
                 client.send_tool_call_update(update);
-            } else {
-                // Fallback path: accumulate stdin into the active command buffer and
-                // defer emission to exec_command_end. Emitting per stdin event would
-                // re-send the entire output+stdin buffer each time and reintroduce the
-                // O(N²) growth fixed in the delta path.
-                active_command.output.push_str(&stdin);
             }
         }
     }
@@ -2745,6 +2723,97 @@ fn parse_command_tool_call(parsed_cmd: Vec<ParsedCommand>, cwd: &Path) -> ParseC
     }
 }
 
+fn acp_safe_tool_call(mut tool_call: ToolCall) -> ToolCall {
+    tool_call.raw_input = acp_safe_raw_json(tool_call.raw_input, "raw_input");
+    tool_call.raw_output = acp_safe_raw_json(tool_call.raw_output, "raw_output");
+    tool_call.content = tool_call
+        .content
+        .into_iter()
+        .map(acp_safe_tool_content)
+        .collect();
+    tool_call
+}
+
+fn acp_safe_tool_call_update(mut update: ToolCallUpdate) -> ToolCallUpdate {
+    update.fields.raw_input = acp_safe_raw_json(update.fields.raw_input, "raw_input");
+    update.fields.raw_output = acp_safe_raw_json(update.fields.raw_output, "raw_output");
+    update.fields.content = update.fields.content.map(|content| {
+        content
+            .into_iter()
+            .map(acp_safe_tool_content)
+            .collect::<Vec<_>>()
+    });
+    update
+}
+
+fn acp_safe_raw_json(
+    value: Option<serde_json::Value>,
+    field: &'static str,
+) -> Option<serde_json::Value> {
+    let value = value?;
+    let Ok(bytes) = serde_json::to_vec(&value) else {
+        return None;
+    };
+    if bytes.len() <= ACP_TOOL_RAW_JSON_BYTE_LIMIT {
+        return Some(value);
+    }
+    warn!(
+        field,
+        bytes = bytes.len(),
+        "dropping oversized ACP tool raw field"
+    );
+    None
+}
+
+fn acp_safe_tool_content(content: ToolCallContent) -> ToolCallContent {
+    match content {
+        ToolCallContent::Content(mut content) => {
+            content.content = acp_safe_content_block(content.content);
+            ToolCallContent::Content(content)
+        }
+        ToolCallContent::Diff(mut diff) => {
+            diff.old_text = diff.old_text.map(acp_safe_text);
+            diff.new_text = acp_safe_text(diff.new_text);
+            ToolCallContent::Diff(diff)
+        }
+        other => other,
+    }
+}
+
+fn acp_safe_content_block(block: ContentBlock) -> ContentBlock {
+    match block {
+        ContentBlock::Text(mut text) => {
+            text.text = acp_safe_text(text.text);
+            ContentBlock::Text(text)
+        }
+        ContentBlock::Resource(mut resource) => {
+            resource.resource = match resource.resource {
+                EmbeddedResourceResource::TextResourceContents(mut contents) => {
+                    contents.text = acp_safe_text(contents.text);
+                    EmbeddedResourceResource::TextResourceContents(contents)
+                }
+                other => other,
+            };
+            ContentBlock::Resource(resource)
+        }
+        other => other,
+    }
+}
+
+fn acp_safe_text(text: String) -> String {
+    if text.len() <= ACP_TOOL_TEXT_BYTE_LIMIT {
+        return text;
+    }
+    let original_len = text.len();
+    let marker =
+        format!("\n\n[truncated for ACP transport; original text was {original_len} bytes]");
+    let mut end = ACP_TOOL_TEXT_BYTE_LIMIT.saturating_sub(marker.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &text[..end], marker)
+}
+
 #[derive(Clone)]
 struct SessionClient {
     session_id: SessionId,
@@ -2820,11 +2889,13 @@ impl SessionClient {
     }
 
     fn send_tool_call(&self, tool_call: ToolCall) {
-        self.send_notification(SessionUpdate::ToolCall(tool_call));
+        self.send_notification(SessionUpdate::ToolCall(acp_safe_tool_call(tool_call)));
     }
 
     fn send_tool_call_update(&self, update: ToolCallUpdate) {
-        self.send_notification(SessionUpdate::ToolCallUpdate(update));
+        self.send_notification(SessionUpdate::ToolCallUpdate(acp_safe_tool_call_update(
+            update,
+        )));
     }
 
     /// Send a completed tool call (used for replay and simple cases)
@@ -5541,6 +5612,133 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_exec_command_fallback_uses_formatted_output() -> anyhow::Result<()> {
+        let session_id = SessionId::new("test");
+        let client = Arc::new(StubClient::new());
+        let session_client = SessionClient::with_client(session_id, client.clone(), Arc::default());
+        let thread = Arc::new(StubCodexThread::new());
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        let (message_tx, _message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut prompt_state =
+            PromptState::new("submission-id".to_string(), thread, message_tx, response_tx);
+        let cwd = std::env::current_dir()?;
+
+        prompt_state.exec_command_begin(
+            &session_client,
+            ExecCommandBeginEvent {
+                call_id: "call-id".to_string(),
+                process_id: None,
+                turn_id: "turn-id".to_string(),
+                command: vec!["rg".to_string(), "usage".to_string()],
+                cwd: cwd.clone().try_into()?,
+                parsed_cmd: vec![ParsedCommand::Search {
+                    cmd: "rg usage ~/.codex".to_string(),
+                    query: Some("usage".to_string()),
+                    path: Some("~/.codex".to_string()),
+                }],
+                source: Default::default(),
+                interaction_input: None,
+                started_at_ms: 0,
+            },
+        );
+
+        prompt_state.exec_command_output_delta(
+            &session_client,
+            ExecCommandOutputDeltaEvent {
+                call_id: "call-id".to_string(),
+                stream: codex_protocol::protocol::ExecOutputStream::Stdout,
+                chunk: vec![b'a'; 1024 * 1024],
+            },
+        );
+
+        let raw_event_output = "b".repeat(1024 * 1024);
+        let formatted_output = "safe formatted output\n".to_string();
+        prompt_state.exec_command_end(
+            &session_client,
+            ExecCommandEndEvent {
+                call_id: "call-id".to_string(),
+                process_id: None,
+                turn_id: "turn-id".to_string(),
+                command: vec!["rg".to_string(), "usage".to_string()],
+                cwd: cwd.try_into()?,
+                parsed_cmd: vec![],
+                source: Default::default(),
+                interaction_input: None,
+                stdout: raw_event_output.clone(),
+                stderr: String::new(),
+                aggregated_output: raw_event_output.clone(),
+                exit_code: 0,
+                duration: std::time::Duration::from_millis(10),
+                formatted_output: formatted_output.clone(),
+                status: ExecCommandStatus::Completed,
+                completed_at_ms: 0,
+            },
+        );
+
+        let notifications = client.notifications.lock().unwrap();
+        let update = notifications
+            .iter()
+            .filter_map(|n| match &n.update {
+                SessionUpdate::ToolCallUpdate(update) => Some(update),
+                _ => None,
+            })
+            .next()
+            .expect("missing tool call update");
+        assert!(update.fields.raw_output.is_none());
+        let content = update.fields.content.as_ref().expect("missing content");
+        let text = match &content[0] {
+            ToolCallContent::Content(Content {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) => text,
+            other => panic!("unexpected content {other:?}"),
+        };
+        assert!(text.contains(&formatted_output));
+        assert!(!text.contains(&raw_event_output[..1024]));
+        assert!(text.len() < 1024);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_tool_call_update_is_sanitized_for_acp_transport() {
+        let raw_output = "r".repeat(ACP_TOOL_RAW_JSON_BYTE_LIMIT + 1024);
+        let text = "t".repeat(ACP_TOOL_TEXT_BYTE_LIMIT + 1024);
+
+        let update = acp_safe_tool_call_update(ToolCallUpdate::new(
+            "call-id",
+            ToolCallUpdateFields::new()
+                .raw_output(serde_json::json!({ "output": raw_output }))
+                .content(vec![
+                    ToolCallContent::Content(Content::new(text)),
+                    ToolCallContent::Diff(Diff::new(
+                        "large.txt",
+                        "n".repeat(ACP_TOOL_TEXT_BYTE_LIMIT + 1024),
+                    )),
+                ]),
+        ));
+
+        assert!(update.fields.raw_output.is_none());
+        let content = update.fields.content.expect("missing content");
+        let text = match &content[0] {
+            ToolCallContent::Content(Content {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) => text,
+            other => panic!("unexpected content {other:?}"),
+        };
+        assert!(text.contains("truncated for ACP transport"));
+        assert!(text.len() <= ACP_TOOL_TEXT_BYTE_LIMIT);
+
+        let diff = match &content[1] {
+            ToolCallContent::Diff(diff) => diff,
+            other => panic!("unexpected content {other:?}"),
+        };
+        assert!(diff.new_text.contains("truncated for ACP transport"));
+        assert!(diff.new_text.len() <= ACP_TOOL_TEXT_BYTE_LIMIT);
     }
 
     #[tokio::test]
