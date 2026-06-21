@@ -18,6 +18,9 @@ function getPlatformPackage() {
       arm64: "codex-acp-linux-arm64",
       x64: "codex-acp-linux-x64",
     },
+    win32: {
+      x64: "codex-acp-win32-x64",
+    },
   };
 
   const packages = platformMap[platform];
@@ -38,10 +41,11 @@ function getPlatformPackage() {
 // Locate the binary
 function getBinaryPath() {
   const packageName = getPlatformPackage();
+  const binaryName = process.platform === "win32" ? "codex-acp.exe" : "codex-acp";
 
   try {
     const binaryPath = fileURLToPath(
-      import.meta.resolve(`${packageName}/bin/codex-acp`),
+      import.meta.resolve(`${packageName}/bin/${binaryName}`),
     );
 
     if (existsSync(binaryPath)) {

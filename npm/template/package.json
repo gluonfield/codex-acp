@@ -13,7 +13,7 @@
     "url": "git+https://github.com/gluonfield/codex-acp.git"
   },
   "bin": {
-    "${PACKAGE_NAME}": "bin/codex-acp"
+    "${PACKAGE_NAME}": "bin/${BINARY_NAME}"
   },
   "os": [
     "${OS}"
