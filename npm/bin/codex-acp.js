@@ -19,6 +19,7 @@ function getPlatformPackage() {
       x64: "codex-acp-linux-x64",
     },
     win32: {
+      arm64: "codex-acp-win32-arm64",
       x64: "codex-acp-win32-x64",
     },
   };

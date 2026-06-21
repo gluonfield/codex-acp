@@ -27,6 +27,7 @@ sed -i.bak "s/\"@jazchat\\/codex-acp-darwin-arm64\": \".*\"/\"@jazchat\\/codex-a
 sed -i.bak "s/\"@jazchat\\/codex-acp-darwin-x64\": \".*\"/\"@jazchat\\/codex-acp-darwin-x64\": \"$VERSION\"/" "$PACKAGE_JSON"
 sed -i.bak "s/\"@jazchat\\/codex-acp-linux-arm64\": \".*\"/\"@jazchat\\/codex-acp-linux-arm64\": \"$VERSION\"/" "$PACKAGE_JSON"
 sed -i.bak "s/\"@jazchat\\/codex-acp-linux-x64\": \".*\"/\"@jazchat\\/codex-acp-linux-x64\": \"$VERSION\"/" "$PACKAGE_JSON"
+sed -i.bak "s/\"@jazchat\\/codex-acp-win32-arm64\": \".*\"/\"@jazchat\\/codex-acp-win32-arm64\": \"$VERSION\"/" "$PACKAGE_JSON"
 sed -i.bak "s/\"@jazchat\\/codex-acp-win32-x64\": \".*\"/\"@jazchat\\/codex-acp-win32-x64\": \"$VERSION\"/" "$PACKAGE_JSON"
 
 # Remove backup file
