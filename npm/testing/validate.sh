@@ -44,7 +44,7 @@ fi
 # 3. Check template has required placeholders
 echo "3. Validating template placeholders..."
 missing_placeholders=0
-for placeholder in PACKAGE_NAME VERSION OS ARCH; do
+for placeholder in PACKAGE_NAME VERSION OS ARCH BINARY_NAME; do
   if ! grep -q "\${${placeholder}}" npm/template/package.json; then
     echo -e "${RED}✗ Template missing ${placeholder} placeholder${NC}"
     missing_placeholders=1
@@ -80,6 +80,7 @@ EXPECTED_PACKAGES=(
   "@jazchat/codex-acp-darwin-x64"
   "@jazchat/codex-acp-linux-arm64"
   "@jazchat/codex-acp-linux-x64"
+  "@jazchat/codex-acp-win32-x64"
 )
 
 missing_packages=0

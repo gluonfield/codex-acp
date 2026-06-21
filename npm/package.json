@@ -1,6 +1,6 @@
 {
   "name": "@jazchat/codex-acp",
-  "version": "0.16.1",
+  "version": "0.16.2",
   "type": "module",
   "description": "An ACP-compatible coding agent powered by Codex",
   "license": "Apache-2.0",
@@ -31,9 +31,10 @@
     "bin"
   ],
   "optionalDependencies": {
-    "@jazchat/codex-acp-darwin-arm64": "0.16.1",
-    "@jazchat/codex-acp-darwin-x64": "0.16.1",
-    "@jazchat/codex-acp-linux-arm64": "0.16.1",
-    "@jazchat/codex-acp-linux-x64": "0.16.1"
+    "@jazchat/codex-acp-darwin-arm64": "0.16.2",
+    "@jazchat/codex-acp-darwin-x64": "0.16.2",
+    "@jazchat/codex-acp-linux-arm64": "0.16.2",
+    "@jazchat/codex-acp-linux-x64": "0.16.2",
+    "@jazchat/codex-acp-win32-x64": "0.16.2"
   }
 }

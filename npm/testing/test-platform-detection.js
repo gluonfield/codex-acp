@@ -17,6 +17,9 @@ function getPlatformPackage() {
       arm64: "codex-acp-linux-arm64",
       x64: "codex-acp-linux-x64",
     },
+    win32: {
+      x64: "codex-acp-win32-x64",
+    },
   };
 
   const packages = platformMap[platform];
@@ -41,6 +44,7 @@ function testAllPlatforms() {
     { platform: "darwin", arch: "x64", expected: "codex-acp-darwin-x64" },
     { platform: "linux", arch: "arm64", expected: "codex-acp-linux-arm64" },
     { platform: "linux", arch: "x64", expected: "codex-acp-linux-x64" },
+    { platform: "win32", arch: "x64", expected: "codex-acp-win32-x64" },
   ];
 
   console.log("Testing platform detection logic...\n");
