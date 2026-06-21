@@ -14,6 +14,8 @@ This tool implements an ACP adapter around the Codex CLI, supporting:
   - /review (with optional instructions)
   - /review-branch
   - /review-commit
+  - /side <question>
+  - /btw <question>
   - /init
   - /compact
   - /logout

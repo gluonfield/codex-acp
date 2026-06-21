@@ -26,7 +26,7 @@ use agent_client_protocol::{
 };
 use codex_apply_patch::parse_patch;
 use codex_core::{
-    CodexThread,
+    CodexThread, ForkSnapshot, RolloutRecorder, ThreadManager,
     config::{Config, set_project_trust_level},
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
@@ -37,6 +37,7 @@ use codex_models_manager::{
     manager::{ModelsManager, RefreshStrategy},
 };
 use codex_protocol::{
+    ThreadId,
     approvals::{
         ElicitationRequest, ElicitationRequestEvent, GuardianAssessmentAction,
         GuardianCommandSource,
@@ -63,16 +64,16 @@ use codex_protocol::{
         ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent,
         ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExecCommandStatus, ExitedReviewModeEvent,
         FileChange, GuardianAssessmentEvent, GuardianAssessmentStatus, ImageGenerationBeginEvent,
-        ImageGenerationEndEvent, ItemCompletedEvent, ItemStartedEvent, McpInvocation,
-        McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent,
-        ModelRerouteEvent, NetworkApprovalContext, NetworkPolicyRuleAction, Op,
-        PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus, PatchApplyUpdatedEvent,
+        ImageGenerationEndEvent, InitialHistory, ItemCompletedEvent, ItemStartedEvent,
+        McpInvocation, McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent,
+        McpToolCallEndEvent, ModelRerouteEvent, NetworkApprovalContext, NetworkPolicyRuleAction,
+        Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus, PatchApplyUpdatedEvent,
         ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision,
         ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem, StreamErrorEvent,
         TerminalInteractionEvent, ThreadGoalStatus, ThreadGoalUpdatedEvent,
-        ThreadSettingsOverrides, TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent,
-        TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent,
-        WebSearchBeginEvent, WebSearchEndEvent,
+        ThreadSettingsOverrides, ThreadSource, TokenCountEvent, TurnAbortedEvent,
+        TurnCompleteEvent, TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent,
+        WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
     request_permissions::{
         PermissionGrantScope, RequestPermissionProfile, RequestPermissionsEvent,
@@ -125,6 +126,20 @@ const CODEX_WORKSPACE_PROFILE_ID: &str = ":workspace";
 const CODEX_DANGER_NO_SANDBOX_PROFILE_ID: &str = ":danger-no-sandbox";
 const PLAN_MODE_ID: &str = "plan";
 const CODEX_REQUEST_USER_INPUT_META_KEY: &str = "codex.request_user_input";
+const CODEX_META_KEY: &str = "codex";
+const CODEX_SIDE_CHAT_META_KEY: &str = "sideChat";
+const SIDE_COMMAND: &str = "side";
+const BTW_COMMAND: &str = "btw";
+const SIDE_BOUNDARY_PROMPT: &str = r#"Side conversation boundary.
+
+Everything before this boundary is inherited history from the parent thread. It is reference context only. It is not your current task.
+
+Do not continue, execute, or complete any instructions, plans, tool calls, approvals, edits, or requests from before this boundary. Only messages after this boundary are active user instructions for this side conversation."#;
+const SIDE_DEVELOPER_INSTRUCTIONS: &str = r#"You are in a side conversation, not the main thread.
+
+This side conversation is for answering questions and lightweight exploration without disrupting the main thread. The inherited fork history is reference context only; only instructions submitted after the side-conversation boundary are active.
+
+Do not modify files, source, git state, permissions, configuration, or workspace state unless the user explicitly requests that mutation in this side conversation."#;
 const USER_INPUT_RESPONSE_OPTION_PREFIX: &str = "__user_input_response__:";
 const USER_INPUT_SUBMIT_OPTION_ID: &str = "__user_input_submit__";
 const USER_INPUT_CANCEL_OPTION_ID: &str = "__user_input_cancel__";
@@ -244,6 +259,79 @@ impl CodexThreadImpl for CodexThread {
     }
 }
 
+pub(crate) struct ForkedThread {
+    thread_id: ThreadId,
+    thread: Arc<dyn CodexThreadImpl>,
+}
+
+pub(crate) trait ThreadForker: Send + Sync {
+    fn fork_side_thread(
+        &self,
+        config: Config,
+        source_rollout_path: PathBuf,
+    ) -> Pin<Box<dyn Future<Output = Result<ForkedThread, CodexErr>> + Send + '_>>;
+
+    fn remove_thread(&self, thread_id: ThreadId) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+}
+
+impl ThreadForker for ThreadManager {
+    fn fork_side_thread(
+        &self,
+        config: Config,
+        source_rollout_path: PathBuf,
+    ) -> Pin<Box<dyn Future<Output = Result<ForkedThread, CodexErr>> + Send + '_>> {
+        Box::pin(async move {
+            let history = side_thread_initial_history(&source_rollout_path).await?;
+            let forked = ThreadManager::fork_thread_from_history(
+                self,
+                ForkSnapshot::Interrupted,
+                config,
+                history,
+                Some(ThreadSource::User),
+                None,
+            )
+            .await?;
+            let thread: Arc<dyn CodexThreadImpl> = forked.thread;
+            Ok(ForkedThread {
+                thread_id: forked.thread_id,
+                thread,
+            })
+        })
+    }
+
+    fn remove_thread(&self, thread_id: ThreadId) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            ThreadManager::remove_thread(self, &thread_id).await;
+        })
+    }
+}
+
+async fn side_thread_initial_history(
+    source_rollout_path: &Path,
+) -> Result<InitialHistory, CodexErr> {
+    let metadata = match tokio::fs::metadata(source_rollout_path).await {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(InitialHistory::New),
+        Err(err) => {
+            return Err(CodexErr::InvalidRequest(format!(
+                "failed to stat rollout path `{}`: {err}",
+                source_rollout_path.display()
+            )));
+        }
+    };
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Ok(InitialHistory::New);
+    }
+    RolloutRecorder::get_rollout_history(source_rollout_path)
+        .await
+        .map_err(|err| {
+            CodexErr::InvalidRequest(format!(
+                "failed to read rollout history `{}`: {err}",
+                source_rollout_path.display()
+            ))
+        })
+}
+
 pub trait ModelsManagerImpl: Send + Sync {
     fn get_model(
         &self,
@@ -320,6 +408,10 @@ enum ThreadMessage {
         request_key: String,
         response: Result<RequestPermissionResponse, Error>,
     },
+    SideEvent {
+        submission_id: String,
+        event: Box<Result<Event, CodexErr>>,
+    },
 }
 
 pub struct Thread {
@@ -332,9 +424,12 @@ pub struct Thread {
 }
 
 impl Thread {
-    pub fn new(
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn new(
         session_id: SessionId,
         thread: Arc<dyn CodexThreadImpl>,
+        thread_forker: Option<Arc<dyn ThreadForker>>,
+        source_rollout_path: Option<PathBuf>,
         auth: Arc<AuthManager>,
         models_manager: Arc<dyn ModelsManagerImpl>,
         client_capabilities: Arc<Mutex<ClientCapabilities>>,
@@ -348,6 +443,8 @@ impl Thread {
             auth,
             SessionClient::new(session_id, cx, client_capabilities),
             thread.clone(),
+            thread_forker,
+            source_rollout_path,
             models_manager,
             config,
             message_rx,
@@ -874,6 +971,23 @@ impl SubmissionState {
             drop(response_tx.send(Err(err)));
         }
     }
+}
+
+struct SideSubmissionState {
+    side_chat_id: String,
+    client: SessionClient,
+    submission: SubmissionState,
+}
+
+#[derive(Clone)]
+struct SideThreadState {
+    thread_id: ThreadId,
+    thread: Arc<dyn CodexThreadImpl>,
+}
+
+struct SidePromptScope {
+    id: String,
+    command: String,
 }
 
 struct ActiveCommand {
@@ -2815,10 +2929,70 @@ fn acp_safe_text(text: String) -> String {
 }
 
 #[derive(Clone)]
+struct SideChatScope {
+    id: String,
+    command: String,
+    parent_session_id: SessionId,
+    thread_id: ThreadId,
+}
+
+#[derive(Clone)]
+enum OutputScope {
+    Main,
+    Side(SideChatScope),
+}
+
+impl OutputScope {
+    fn apply(&self, update: &mut SessionUpdate) {
+        let Self::Side(scope) = self else {
+            return;
+        };
+        match update {
+            SessionUpdate::UserMessageChunk(chunk)
+            | SessionUpdate::AgentMessageChunk(chunk)
+            | SessionUpdate::AgentThoughtChunk(chunk) => {
+                scope.merge_meta(&mut chunk.meta);
+            }
+            SessionUpdate::ToolCall(tool_call) => {
+                scope.merge_meta(&mut tool_call.meta);
+            }
+            SessionUpdate::ToolCallUpdate(update) => {
+                scope.merge_meta(&mut update.meta);
+            }
+            SessionUpdate::UsageUpdate(update) => {
+                scope.merge_meta(&mut update.meta);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl SideChatScope {
+    fn merge_meta(&self, meta: &mut Option<Meta>) {
+        let meta = meta.get_or_insert_with(Meta::new);
+        let mut codex = match meta.remove(CODEX_META_KEY) {
+            Some(serde_json::Value::Object(object)) => object,
+            _ => Meta::new(),
+        };
+        codex.insert(
+            CODEX_SIDE_CHAT_META_KEY.to_string(),
+            json!({
+                "id": self.id.clone(),
+                "command": self.command.clone(),
+                "parentSessionId": self.parent_session_id.0.to_string(),
+                "threadId": self.thread_id.to_string(),
+            }),
+        );
+        meta.insert(CODEX_META_KEY.to_string(), serde_json::Value::Object(codex));
+    }
+}
+
+#[derive(Clone)]
 struct SessionClient {
     session_id: SessionId,
     client: Arc<dyn ClientSender>,
     client_capabilities: Arc<Mutex<ClientCapabilities>>,
+    scope: OutputScope,
 }
 
 impl SessionClient {
@@ -2831,6 +3005,7 @@ impl SessionClient {
             session_id,
             client: Arc::new(AcpConnection(cx)),
             client_capabilities,
+            scope: OutputScope::Main,
         }
     }
 
@@ -2844,6 +3019,16 @@ impl SessionClient {
             session_id,
             client,
             client_capabilities,
+            scope: OutputScope::Main,
+        }
+    }
+
+    fn scoped(&self, scope: OutputScope) -> Self {
+        Self {
+            session_id: self.session_id.clone(),
+            client: self.client.clone(),
+            client_capabilities: self.client_capabilities.clone(),
+            scope,
         }
     }
 
@@ -2861,7 +3046,8 @@ impl SessionClient {
                 })
     }
 
-    fn send_notification(&self, update: SessionUpdate) {
+    fn send_notification(&self, mut update: SessionUpdate) {
+        self.scope.apply(&mut update);
         if let Err(e) = self
             .client
             .send_session_notification(SessionNotification::new(self.session_id.clone(), update))
@@ -2984,6 +3170,8 @@ struct ThreadActor<A> {
     client: SessionClient,
     /// The thread associated with this task.
     thread: Arc<dyn CodexThreadImpl>,
+    thread_forker: Option<Arc<dyn ThreadForker>>,
+    source_rollout_path: Option<PathBuf>,
     /// The configuration for the thread.
     config: Config,
     /// The models available for this thread.
@@ -2992,6 +3180,8 @@ struct ThreadActor<A> {
     resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
     /// A sender for each interested `Op` submission that needs events routed.
     submissions: HashMap<String, SubmissionState>,
+    side_submissions: HashMap<String, SideSubmissionState>,
+    side_threads: HashMap<String, SideThreadState>,
     /// A receiver for incoming thread messages.
     message_rx: mpsc::UnboundedReceiver<ThreadMessage>,
     /// A receiver for spawned interaction results.
@@ -3008,6 +3198,8 @@ impl<A: Auth> ThreadActor<A> {
         auth: A,
         client: SessionClient,
         thread: Arc<dyn CodexThreadImpl>,
+        thread_forker: Option<Arc<dyn ThreadForker>>,
+        source_rollout_path: Option<PathBuf>,
         models_manager: Arc<dyn ModelsManagerImpl>,
         config: Config,
         message_rx: mpsc::UnboundedReceiver<ThreadMessage>,
@@ -3018,10 +3210,14 @@ impl<A: Auth> ThreadActor<A> {
             auth,
             client,
             thread,
+            thread_forker,
+            source_rollout_path,
             config,
             models_manager,
             resolution_tx,
             submissions: HashMap::new(),
+            side_submissions: HashMap::new(),
+            side_threads: HashMap::new(),
             message_rx,
             resolution_rx,
             last_sent_config_options: None,
@@ -3053,7 +3249,10 @@ impl<A: Auth> ThreadActor<A> {
             self.submissions
                 .retain(|_, submission| submission.is_active());
 
-            if !message_rx_open && self.submissions.is_empty() {
+            if !message_rx_open && self.submissions.is_empty() && self.side_submissions.is_empty() {
+                for side_chat_id in self.side_threads.keys().cloned().collect::<Vec<_>>() {
+                    self.cleanup_side_thread(&side_chat_id).await;
+                }
                 break;
             }
         }
@@ -3119,26 +3318,87 @@ impl<A: Auth> ThreadActor<A> {
                 request_key,
                 response,
             } => {
-                let Some(submission) = self.submissions.get_mut(&submission_id) else {
-                    warn!(
-                        "Ignoring permission response for unknown submission ID: {submission_id}"
-                    );
+                if let Some(submission) = self.submissions.get_mut(&submission_id) {
+                    if let Err(err) = submission
+                        .handle_permission_request_resolved(
+                            &self.client,
+                            interaction_id,
+                            request_key,
+                            response,
+                        )
+                        .await
+                    {
+                        submission.detach_pending_interactions();
+                        submission.fail(err);
+                    }
                     return;
-                };
-
-                if let Err(err) = submission
-                    .handle_permission_request_resolved(
-                        &self.client,
-                        interaction_id,
-                        request_key,
-                        response,
-                    )
-                    .await
-                {
-                    submission.detach_pending_interactions();
-                    submission.fail(err);
                 }
+
+                if let Some(side) = self.side_submissions.get_mut(&submission_id) {
+                    if let Err(err) = side
+                        .submission
+                        .handle_permission_request_resolved(
+                            &side.client,
+                            interaction_id,
+                            request_key,
+                            response,
+                        )
+                        .await
+                    {
+                        side.submission.detach_pending_interactions();
+                        side.submission.fail(err);
+                    }
+                    return;
+                }
+
+                warn!("Ignoring permission response for unknown submission ID: {submission_id}");
             }
+            ThreadMessage::SideEvent {
+                submission_id,
+                event,
+            } => {
+                self.handle_side_event(submission_id, *event).await;
+            }
+        }
+    }
+
+    async fn handle_side_event(&mut self, submission_id: String, event: Result<Event, CodexErr>) {
+        let event = match event {
+            Ok(event) => event,
+            Err(err) => {
+                warn!("Side chat event stream failed for {submission_id}: {err:?}");
+                if let Some(mut side) = self.side_submissions.remove(&submission_id) {
+                    side.submission
+                        .fail(Error::internal_error().data(err.to_string()));
+                    self.cleanup_side_thread(&side.side_chat_id).await;
+                }
+                return;
+            }
+        };
+
+        let Some(side) = self.side_submissions.get_mut(&submission_id) else {
+            warn!("Received side event for unknown submission ID: {submission_id}");
+            return;
+        };
+
+        side.submission.handle_event(&side.client, event.msg).await;
+        if !side.submission.is_active() {
+            self.side_submissions.remove(&submission_id);
+        }
+    }
+
+    async fn cleanup_side_thread(&mut self, side_chat_id: &str) {
+        let Some(side) = self.side_threads.remove(side_chat_id) else {
+            return;
+        };
+        if let Err(err) = side.thread.submit(Op::Shutdown).await {
+            warn!(
+                "Failed to shut down side chat thread {}: {err:?}",
+                side.thread_id
+            );
+        }
+        if let Some(forker) = &self.thread_forker {
+            forker.remove_thread(side.thread_id).await;
         }
     }
 
@@ -3162,6 +3422,20 @@ impl<A: Auth> ThreadActor<A> {
             )
             .input(AvailableCommandInput::Unstructured(
                 UnstructuredCommandInput::new("commit sha"),
+            )),
+            AvailableCommand::new(
+                SIDE_COMMAND,
+                "start an ephemeral side conversation without changing the main thread",
+            )
+            .input(AvailableCommandInput::Unstructured(
+                UnstructuredCommandInput::new("question"),
+            )),
+            AvailableCommand::new(
+                BTW_COMMAND,
+                "start an ephemeral side conversation without changing the main thread",
+            )
+            .input(AvailableCommandInput::Unstructured(
+                UnstructuredCommandInput::new("question"),
             )),
             AvailableCommand::new(
                 "init",
@@ -3456,10 +3730,26 @@ impl<A: Auth> ThreadActor<A> {
     ) -> Result<oneshot::Receiver<Result<StopReason, Error>>, Error> {
         let (response_tx, response_rx) = oneshot::channel();
 
+        let side_scope = side_prompt_scope(request.meta.as_ref());
         let items = build_prompt_items(request.prompt);
+        if let Some(scope) = side_scope {
+            return self
+                .handle_side_prompt(scope, items, None, response_tx, response_rx)
+                .await;
+        }
         let op;
         if let Some((name, rest)) = extract_slash_command(&items) {
             match name {
+                SIDE_COMMAND | BTW_COMMAND => {
+                    let scope = SidePromptScope {
+                        id: format!("side_{}", Uuid::new_v4()),
+                        command: name.to_string(),
+                    };
+                    let rest = rest.to_string();
+                    return self
+                        .handle_side_prompt(scope, items, Some(&rest), response_tx, response_rx)
+                        .await;
+                }
                 "compact" => op = Op::Compact,
                 "init" => {
                     op = Op::UserInput {
@@ -3561,6 +3851,102 @@ impl<A: Auth> ThreadActor<A> {
         Ok(response_rx)
     }
 
+    async fn handle_side_prompt(
+        &mut self,
+        scope: SidePromptScope,
+        items: Vec<UserInput>,
+        rest: Option<&str>,
+        response_tx: oneshot::Sender<Result<StopReason, Error>>,
+        response_rx: oneshot::Receiver<Result<StopReason, Error>>,
+    ) -> Result<oneshot::Receiver<Result<StopReason, Error>>, Error> {
+        let (side, new_side_thread) = if let Some(side) = self.side_threads.get(&scope.id) {
+            (side.clone(), false)
+        } else {
+            let forker = self
+                .thread_forker
+                .clone()
+                .ok_or_else(|| Error::invalid_params().data("Side chat is unavailable"))?;
+            let source_rollout_path = self
+                .source_rollout_path
+                .clone()
+                .ok_or_else(|| Error::invalid_params().data("Side chat requires a rollout file"))?;
+
+            let mut config = self.config.clone();
+            config.ephemeral = true;
+            config.developer_instructions = append_developer_instructions(
+                config.developer_instructions.take(),
+                SIDE_DEVELOPER_INSTRUCTIONS,
+            );
+
+            let forked = forker
+                .fork_side_thread(config, source_rollout_path)
+                .await
+                .map_err(|e| Error::internal_error().data(e.to_string()))?;
+            let side = SideThreadState {
+                thread_id: forked.thread_id,
+                thread: forked.thread,
+            };
+            self.side_threads.insert(scope.id.clone(), side.clone());
+            (side, true)
+        };
+
+        if self
+            .side_submissions
+            .values()
+            .any(|submission| submission.side_chat_id == scope.id)
+        {
+            return Err(Error::invalid_params().data("Side chat is already running"));
+        }
+
+        let items = if new_side_thread {
+            match build_side_prompt_items(items, rest) {
+                Ok(items) => items,
+                Err(err) => {
+                    self.cleanup_side_thread(&scope.id).await;
+                    return Err(err);
+                }
+            }
+        } else {
+            items
+        };
+
+        let submission_id = match side.thread.submit(user_input_op(items)).await {
+            Ok(submission_id) => submission_id,
+            Err(err) => {
+                if new_side_thread {
+                    self.cleanup_side_thread(&scope.id).await;
+                }
+                return Err(Error::internal_error().data(err.to_string()));
+            }
+        };
+        let thread_id = side.thread_id;
+        let side_client = self.client.scoped(OutputScope::Side(SideChatScope {
+            id: scope.id.clone(),
+            command: scope.command.clone(),
+            parent_session_id: self.client.session_id.clone(),
+            thread_id,
+        }));
+
+        info!("Submitted side prompt with submission_id: {submission_id}");
+
+        self.side_submissions.insert(
+            submission_id.clone(),
+            SideSubmissionState {
+                side_chat_id: scope.id,
+                client: side_client,
+                submission: SubmissionState::Prompt(PromptState::new(
+                    submission_id.clone(),
+                    side.thread.clone(),
+                    self.resolution_tx.clone(),
+                    response_tx,
+                )),
+            },
+        );
+        spawn_side_event_forwarder(submission_id, side.thread, self.resolution_tx.clone());
+
+        Ok(response_rx)
+    }
+
     async fn handle_set_mode(&mut self, mode: SessionModeId) -> Result<(), Error> {
         if mode.0.as_ref() == PLAN_MODE_ID {
             let collaboration_mode = self.collaboration_mode_for_kind(ModeKind::Plan).await;
@@ -3640,6 +4026,9 @@ impl<A: Auth> ThreadActor<A> {
 
     async fn handle_shutdown(&mut self) -> Result<(), Error> {
         self.detach_pending_interactions();
+        for side_chat_id in self.side_threads.keys().cloned().collect::<Vec<_>>() {
+            self.cleanup_side_thread(&side_chat_id).await;
+        }
         self.thread
             .submit(Op::Shutdown)
             .await
@@ -3650,6 +4039,9 @@ impl<A: Auth> ThreadActor<A> {
     fn detach_pending_interactions(&mut self) {
         for submission in self.submissions.values_mut() {
             submission.detach_pending_interactions();
+        }
+        for side in self.side_submissions.values_mut() {
+            side.submission.detach_pending_interactions();
         }
     }
 
@@ -4033,6 +4425,92 @@ fn build_prompt_items(prompt: Vec<ContentBlock>) -> Vec<UserInput> {
             ContentBlock::Audio(..) | ContentBlock::Resource(..) | _ => None,
         })
         .collect()
+}
+
+fn user_input_op(items: Vec<UserInput>) -> Op {
+    Op::UserInput {
+        items,
+        final_output_json_schema: None,
+        environments: None,
+        responsesapi_client_metadata: None,
+        additional_context: Default::default(),
+        thread_settings: Default::default(),
+    }
+}
+
+fn build_side_prompt_items(
+    mut items: Vec<UserInput>,
+    rest: Option<&str>,
+) -> Result<Vec<UserInput>, Error> {
+    let Some(UserInput::Text { text, .. }) = items.first_mut() else {
+        return Err(Error::invalid_params().data("/side requires a text question"));
+    };
+    let question = rest.unwrap_or(text).trim();
+    if question.is_empty() {
+        return Err(Error::invalid_params().data("/side requires a question"));
+    }
+    *text = format!("{SIDE_BOUNDARY_PROMPT}\n\nSide conversation question:\n{question}");
+
+    Ok(items)
+}
+
+fn side_prompt_scope(meta: Option<&Meta>) -> Option<SidePromptScope> {
+    let side = meta?
+        .get(CODEX_META_KEY)?
+        .as_object()?
+        .get(CODEX_SIDE_CHAT_META_KEY)?
+        .as_object()?;
+    let id = side.get("id")?.as_str()?.trim();
+    if id.is_empty() {
+        return None;
+    }
+    let command = side
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .filter(|command| !command.trim().is_empty())
+        .unwrap_or(SIDE_COMMAND);
+    Some(SidePromptScope {
+        id: id.to_string(),
+        command: command.to_string(),
+    })
+}
+
+fn spawn_side_event_forwarder(
+    submission_id: String,
+    thread: Arc<dyn CodexThreadImpl>,
+    resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let event = thread.next_event().await;
+            let terminal = is_terminal_side_event(&event);
+            if resolution_tx
+                .send(ThreadMessage::SideEvent {
+                    submission_id: submission_id.clone(),
+                    event: Box::new(event),
+                })
+                .is_err()
+            {
+                break;
+            }
+            if terminal {
+                break;
+            }
+        }
+    });
+}
+
+fn is_terminal_side_event(event: &Result<Event, CodexErr>) -> bool {
+    match event {
+        Err(_) => true,
+        Ok(Event { msg, .. }) => matches!(
+            msg,
+            EventMsg::Error(_)
+                | EventMsg::TurnComplete(_)
+                | EventMsg::TurnAborted(_)
+                | EventMsg::ShutdownComplete
+        ),
+    }
 }
 
 fn format_uri_as_link(name: Option<String>, uri: String) -> String {
@@ -4432,7 +4910,9 @@ mod tests {
             response_tx: prompt_response_tx,
         })?;
 
-        let stop_reason = prompt_response_rx.await??.await??;
+        let stop_reason_rx =
+            tokio::time::timeout(Duration::from_secs(2), prompt_response_rx).await???;
+        let stop_reason = tokio::time::timeout(Duration::from_secs(2), stop_reason_rx).await???;
         assert_eq!(stop_reason, StopReason::EndTurn);
         drop(message_tx);
 
@@ -5003,6 +5483,242 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn builtin_commands_include_side_chat() {
+        let names = ThreadActor::<StubAuth>::builtin_commands()
+            .into_iter()
+            .map(|command| command.name)
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&SIDE_COMMAND.to_string()));
+        assert!(names.contains(&BTW_COMMAND.to_string()));
+    }
+
+    #[tokio::test]
+    async fn side_prompt_uses_ephemeral_fork_with_scoped_metadata() -> anyhow::Result<()> {
+        let side_thread = Arc::new(StubCodexThread::new());
+        let forker = Arc::new(StubThreadForker::new(side_thread.clone()));
+        let thread_forker: Arc<dyn ThreadForker> = forker.clone();
+        let rollout_path = PathBuf::from("/tmp/codex-rollout.jsonl");
+        let (session_id, client, main_thread, message_tx, _handle) = setup_with_config_and_forker(
+            test_config().await?,
+            Some(thread_forker),
+            Some(rollout_path.clone()),
+        )
+        .await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/btw what changed?".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+
+        assert!(main_thread.ops.lock().unwrap().is_empty());
+
+        {
+            let configs = forker.configs.lock().unwrap();
+            assert_eq!(configs.len(), 1);
+            assert!(configs[0].ephemeral);
+            assert!(
+                configs[0]
+                    .developer_instructions
+                    .as_deref()
+                    .is_some_and(|instructions| instructions.contains("side conversation"))
+            );
+        }
+        assert_eq!(forker.paths.lock().unwrap().as_slice(), &[rollout_path]);
+        assert!(forker.removed.lock().unwrap().is_empty());
+
+        {
+            let side_ops = side_thread.ops.lock().unwrap();
+            let Some(Op::UserInput { items, .. }) = side_ops.first() else {
+                panic!("expected side prompt, got {side_ops:?}");
+            };
+            let Some(UserInput::Text { text, .. }) = items.first() else {
+                panic!("expected side text input, got {items:?}");
+            };
+            assert!(text.starts_with(SIDE_BOUNDARY_PROMPT));
+            assert!(text.contains("Side conversation question:\nwhat changed?"));
+        }
+
+        let side_id = {
+            let notifications = client.notifications.lock().unwrap();
+            let chunk = notifications
+                .iter()
+                .find_map(|notification| match &notification.update {
+                    SessionUpdate::AgentMessageChunk(chunk) => Some(chunk),
+                    _ => None,
+                })
+                .expect("side chat should stream an agent message");
+            assert!(
+                matches!(
+                    &chunk.content,
+                    ContentBlock::Text(TextContent { text, .. })
+                        if text.contains("Side conversation question:\nwhat changed?")
+                ),
+                "unexpected side chunk {chunk:?}"
+            );
+            let meta = chunk.meta.as_ref().expect("side chunk should include meta");
+            let side = meta
+                .get(CODEX_META_KEY)
+                .and_then(|value| value.as_object())
+                .and_then(|codex| codex.get(CODEX_SIDE_CHAT_META_KEY))
+                .and_then(|value| value.as_object())
+                .expect("side chunk should include codex side chat metadata");
+            assert_eq!(
+                side.get("command").and_then(|value| value.as_str()),
+                Some(BTW_COMMAND)
+            );
+            assert_eq!(
+                side.get("parentSessionId").and_then(|value| value.as_str()),
+                Some("test")
+            );
+            let side_thread_id = forker.thread_id.to_string();
+            assert_eq!(
+                side.get("threadId").and_then(|value| value.as_str()),
+                Some(side_thread_id.as_str())
+            );
+            side.get("id")
+                .and_then(|value| value.as_str())
+                .expect("side metadata should include id")
+                .to_string()
+        };
+
+        let (follow_response_tx, follow_response_rx) = tokio::sync::oneshot::channel();
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["and now?".into()]).meta(
+                serde_json::json!({
+                    "codex": {
+                        "sideChat": {
+                            "id": side_id,
+                            "command": BTW_COMMAND,
+                        },
+                    },
+                })
+                .as_object()
+                .cloned()
+                .unwrap(),
+            ),
+            response_tx: follow_response_tx,
+        })?;
+
+        let stop_reason_rx =
+            tokio::time::timeout(Duration::from_secs(2), follow_response_rx).await???;
+        let stop_reason = tokio::time::timeout(Duration::from_secs(2), stop_reason_rx).await???;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        assert_eq!(forker.configs.lock().unwrap().len(), 1);
+        {
+            let side_ops = side_thread.ops.lock().unwrap();
+            assert!(
+                matches!(
+                    side_ops.get(1),
+                    Some(Op::UserInput { items, .. })
+                        if matches!(items.first(), Some(UserInput::Text { text, .. }) if text == "and now?")
+                ),
+                "expected side follow-up on same fork, got {side_ops:?}"
+            );
+        }
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        message_tx.send(ThreadMessage::Shutdown {
+            response_tx: shutdown_tx,
+        })?;
+        shutdown_rx.await??;
+        assert_eq!(
+            forker.removed.lock().unwrap().as_slice(),
+            &[forker.thread_id]
+        );
+        drop(message_tx);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn side_prompt_runs_while_main_prompt_is_open() -> anyhow::Result<()> {
+        let side_thread = Arc::new(StubCodexThread::new());
+        let forker = Arc::new(StubThreadForker::new(side_thread.clone()));
+        let thread_forker: Arc<dyn ThreadForker> = forker.clone();
+        let (session_id, _client, main_thread, message_tx, _handle) = setup_with_config_and_forker(
+            test_config().await?,
+            Some(thread_forker),
+            Some(PathBuf::from("/tmp/codex-rollout.jsonl")),
+        )
+        .await?;
+
+        let (main_response_tx, main_response_rx) = tokio::sync::oneshot::channel();
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["hold-open".into()]),
+            response_tx: main_response_tx,
+        })?;
+        let mut main_stop_rx = main_response_rx.await??;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut main_stop_rx)
+                .await
+                .is_err(),
+            "main prompt should stay open"
+        );
+
+        let (side_response_tx, side_response_rx) = tokio::sync::oneshot::channel();
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["quick side check".into()]).meta(
+                serde_json::json!({
+                    "codex": {
+                        "sideChat": {
+                            "id": "side-probe",
+                            "command": SIDE_COMMAND,
+                        },
+                    },
+                })
+                .as_object()
+                .cloned()
+                .unwrap(),
+            ),
+            response_tx: side_response_tx,
+        })?;
+
+        let side_stop_rx =
+            tokio::time::timeout(Duration::from_secs(2), side_response_rx).await???;
+        let side_stop_reason =
+            tokio::time::timeout(Duration::from_secs(2), side_stop_rx).await???;
+        assert_eq!(side_stop_reason, StopReason::EndTurn);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut main_stop_rx)
+                .await
+                .is_err(),
+            "side prompt should not complete the main prompt"
+        );
+        assert_eq!(forker.configs.lock().unwrap().len(), 1);
+        {
+            let main_ops = main_thread.ops.lock().unwrap();
+            assert!(
+                matches!(
+                    main_ops.as_slice(),
+                    [Op::UserInput { items, .. }]
+                        if matches!(items.first(), Some(UserInput::Text { text, .. }) if text == "hold-open")
+                ),
+                "main prompt should not receive side input: {main_ops:?}"
+            );
+        }
+        {
+            let side_ops = side_thread.ops.lock().unwrap();
+            assert!(
+                matches!(side_ops.as_slice(), [Op::UserInput { .. }]),
+                "side prompt should run on fork: {side_ops:?}"
+            );
+        }
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        message_tx.send(ThreadMessage::Shutdown {
+            response_tx: shutdown_tx,
+        })?;
+        shutdown_rx.await??;
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_delta_deduplication() -> anyhow::Result<()> {
         let (session_id, client, _, message_tx, _handle) = setup().await?;
@@ -5064,6 +5780,20 @@ mod tests {
         UnboundedSender<ThreadMessage>,
         tokio::task::JoinHandle<()>,
     )> {
+        setup_with_config_and_forker(config, None, None).await
+    }
+
+    async fn setup_with_config_and_forker(
+        config: Config,
+        thread_forker: Option<Arc<dyn ThreadForker>>,
+        source_rollout_path: Option<PathBuf>,
+    ) -> anyhow::Result<(
+        SessionId,
+        Arc<StubClient>,
+        Arc<StubCodexThread>,
+        UnboundedSender<ThreadMessage>,
+        tokio::task::JoinHandle<()>,
+    )> {
         let session_id = SessionId::new("test");
         let client = Arc::new(StubClient::new());
         let session_client =
@@ -5077,6 +5807,8 @@ mod tests {
             StubAuth,
             session_client,
             conversation.clone(),
+            thread_forker,
+            source_rollout_path,
             models_manager,
             config,
             message_rx,
@@ -5236,6 +5968,7 @@ mod tests {
                                 duration_ms: None,
                                 time_to_first_token_ms: None,
                             }));
+                        } else if prompt == "hold-open" {
                         } else if prompt == "image-generation" {
                             let turn_id = id.to_string();
                             let saved_path = image_generation_test_saved_path();
@@ -5472,6 +6205,52 @@ mod tests {
                     return Err(CodexErr::InternalAgentDied);
                 };
                 Ok(event)
+            })
+        }
+    }
+
+    struct StubThreadForker {
+        thread_id: ThreadId,
+        thread: Arc<StubCodexThread>,
+        configs: std::sync::Mutex<Vec<Config>>,
+        paths: std::sync::Mutex<Vec<PathBuf>>,
+        removed: std::sync::Mutex<Vec<ThreadId>>,
+    }
+
+    impl StubThreadForker {
+        fn new(thread: Arc<StubCodexThread>) -> Self {
+            Self {
+                thread_id: ThreadId::default(),
+                thread,
+                configs: std::sync::Mutex::default(),
+                paths: std::sync::Mutex::default(),
+                removed: std::sync::Mutex::default(),
+            }
+        }
+    }
+
+    impl ThreadForker for StubThreadForker {
+        fn fork_side_thread(
+            &self,
+            config: Config,
+            source_rollout_path: PathBuf,
+        ) -> Pin<Box<dyn Future<Output = Result<ForkedThread, CodexErr>> + Send + '_>> {
+            Box::pin(async move {
+                self.configs.lock().unwrap().push(config);
+                self.paths.lock().unwrap().push(source_rollout_path);
+                Ok(ForkedThread {
+                    thread_id: self.thread_id,
+                    thread: self.thread.clone(),
+                })
+            })
+        }
+
+        fn remove_thread(
+            &self,
+            thread_id: ThreadId,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(async move {
+                self.removed.lock().unwrap().push(thread_id);
             })
         }
     }
@@ -6187,6 +6966,8 @@ mod tests {
             StubAuth,
             session_client,
             conversation.clone(),
+            None,
+            None,
             models_manager,
             config,
             message_rx,

@@ -41,7 +41,7 @@ use tracing::{debug, info};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::developer_instructions::apply_session_meta_developer_instructions;
-use crate::thread::Thread;
+use crate::thread::{Thread, ThreadForker};
 
 /// The Codex implementation of the ACP Agent.
 ///
@@ -55,7 +55,7 @@ pub struct CodexAgent {
     /// The underlying codex configuration
     config: Config,
     /// Thread manager for handling sessions
-    thread_manager: ThreadManager,
+    thread_manager: Arc<ThreadManager>,
     /// Store for listing and updating persisted thread metadata
     thread_store: Arc<dyn ThreadStore>,
     /// SQLite-backed Codex state index, when initialization succeeds
@@ -95,7 +95,7 @@ impl CodexAgent {
         );
         let thread_store = thread_store_from_config(&config, state_db.clone());
         let installation_id = resolve_installation_id(&config.codex_home).await?;
-        let thread_manager = ThreadManager::new(
+        let thread_manager = Arc::new(ThreadManager::new(
             &config,
             auth_manager.clone(),
             SessionSource::Unknown,
@@ -106,7 +106,7 @@ impl CodexAgent {
             state_db.clone(),
             installation_id,
             None,
-        );
+        ));
         Ok(Self {
             auth_manager,
             client_capabilities,
@@ -575,7 +575,7 @@ impl CodexAgent {
         let NewThread {
             thread_id,
             thread,
-            session_configured: _,
+            session_configured,
         } = Box::pin(self.thread_manager.start_thread(config.clone()))
             .await
             .map_err(|_e| Error::internal_error())?;
@@ -586,9 +586,12 @@ impl CodexAgent {
             .lock()
             .unwrap()
             .insert(session_id.clone(), config.cwd.to_path_buf());
+        let thread_forker: Arc<dyn ThreadForker> = self.thread_manager.clone();
         let thread = Arc::new(Thread::new(
             session_id.clone(),
             thread,
+            Some(thread_forker),
+            session_configured.rollout_path,
             self.auth_manager.clone(),
             Arc::new(self.thread_manager.get_models_manager()),
             self.client_capabilities.clone(),
@@ -694,19 +697,22 @@ impl CodexAgent {
         let NewThread {
             thread_id: _,
             thread,
-            session_configured: _,
+            session_configured,
         } = Box::pin(self.thread_manager.resume_thread_from_rollout(
             config.clone(),
-            rollout_path,
+            rollout_path.clone(),
             self.auth_manager.clone(),
             None,
         ))
         .await
         .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
+        let thread_forker: Arc<dyn ThreadForker> = self.thread_manager.clone();
         let thread = Arc::new(Thread::new(
             session_id.clone(),
             thread,
+            Some(thread_forker),
+            session_configured.rollout_path.or(Some(rollout_path)),
             self.auth_manager.clone(),
             Arc::new(self.thread_manager.get_models_manager()),
             self.client_capabilities.clone(),
