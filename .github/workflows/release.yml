@@ -51,8 +51,6 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
 
     runs-on: ${{ matrix.os }}
 
@@ -113,9 +111,6 @@ jobs:
         shell: bash
         run: |
           BINARY_NAME="codex-acp"
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
-            BINARY_NAME="codex-acp.exe"
-          fi
           ARCHIVE_NAME="codex-acp-${{ needs.get-version.outputs.version }}-${{ matrix.target }}"
 
           cd target/${{ matrix.target }}/release
