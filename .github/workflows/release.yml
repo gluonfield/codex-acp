@@ -96,6 +96,10 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: bash "${GITHUB_WORKSPACE}/.github/scripts/install-bundled-bwrap.sh"
 
+      - name: Static CRT on Windows
+        if: ${{ runner.os == 'Windows' }}
+        run: echo "RUSTFLAGS=-C target-feature=+crt-static" >> $env:GITHUB_ENV
+
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
