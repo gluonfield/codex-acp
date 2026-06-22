@@ -10,6 +10,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing_subscriber::EnvFilter;
 
 mod codex_agent;
+mod collab_subagents;
 mod developer_instructions;
 mod thread;
 
