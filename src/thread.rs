@@ -17,8 +17,8 @@ use agent_client_protocol::{
         RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
         ResourceLink, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
         SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
-        SessionConfigValueId, SessionId, SessionMode, SessionModeId, SessionModeState,
-        SessionNotification, SessionUpdate, StopReason, Terminal, TextContent,
+        SessionConfigValueId, SessionId, SessionInfoUpdate, SessionMode, SessionModeId,
+        SessionModeState, SessionNotification, SessionUpdate, StopReason, Terminal, TextContent,
         TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation,
         ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
         UsageUpdate,
@@ -59,7 +59,7 @@ use codex_protocol::{
     plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
     protocol::{
         AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent,
-        AgentReasoningRawContentEvent, AgentReasoningSectionBreakEvent,
+        AgentReasoningRawContentEvent, AgentReasoningSectionBreakEvent, AgentStatus,
         ApplyPatchApprovalRequestEvent, DynamicToolCallResponseEvent, ElicitationAction,
         ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent,
         ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExecCommandStatus, ExitedReviewModeEvent,
@@ -1665,6 +1665,158 @@ impl PromptState {
                 );
                 self.guardian_assessment(client, event);
             }
+            EventMsg::CollabAgentSpawnEnd(event) => {
+                if let Some(thread_id) = event.new_thread_id {
+                    client.send_provider_subagent(json!({
+                        "provider": "codex",
+                        "id": thread_id.to_string(),
+                        "thread_id": thread_id.to_string(),
+                        "parent_id": event.sender_thread_id.to_string(),
+                        "name": event.new_agent_nickname,
+                        "role": event.new_agent_role,
+                        "status": codex_agent_status(&event.status),
+                        "summary": "Spawned",
+                        "prompt": event.prompt,
+                        "model": event.model,
+                        "reasoning_effort": format!("{:?}", event.reasoning_effort),
+                        "completed_at_ms": event.completed_at_ms,
+                    }));
+                }
+            }
+            EventMsg::CollabAgentInteractionBegin(event) => {
+                client.send_provider_subagent(json!({
+                    "provider": "codex",
+                    "id": event.receiver_thread_id.to_string(),
+                    "thread_id": event.receiver_thread_id.to_string(),
+                    "parent_id": event.sender_thread_id.to_string(),
+                    "status": "running",
+                    "summary": "Working",
+                    "prompt": event.prompt,
+                    "started_at_ms": event.started_at_ms,
+                }));
+            }
+            EventMsg::CollabAgentInteractionEnd(event) => {
+                client.send_provider_subagent(json!({
+                    "provider": "codex",
+                    "id": event.receiver_thread_id.to_string(),
+                    "thread_id": event.receiver_thread_id.to_string(),
+                    "parent_id": event.sender_thread_id.to_string(),
+                    "name": event.receiver_agent_nickname,
+                    "role": event.receiver_agent_role,
+                    "status": codex_agent_status(&event.status),
+                    "summary": "Responded",
+                    "prompt": event.prompt,
+                    "completed_at_ms": event.completed_at_ms,
+                }));
+            }
+            EventMsg::CollabWaitingBegin(event) => {
+                if event.receiver_agents.is_empty() {
+                    for thread_id in event.receiver_thread_ids {
+                        client.send_provider_subagent(json!({
+                            "provider": "codex",
+                            "id": thread_id.to_string(),
+                            "thread_id": thread_id.to_string(),
+                            "parent_id": event.sender_thread_id.to_string(),
+                            "status": "running",
+                            "summary": "Waiting",
+                            "started_at_ms": event.started_at_ms,
+                        }));
+                    }
+                } else {
+                    for agent in event.receiver_agents {
+                        client.send_provider_subagent(json!({
+                            "provider": "codex",
+                            "id": agent.thread_id.to_string(),
+                            "thread_id": agent.thread_id.to_string(),
+                            "parent_id": event.sender_thread_id.to_string(),
+                            "name": agent.agent_nickname,
+                            "role": agent.agent_role,
+                            "status": "running",
+                            "summary": "Waiting",
+                            "started_at_ms": event.started_at_ms,
+                        }));
+                    }
+                }
+            }
+            EventMsg::CollabWaitingEnd(event) => {
+                if event.agent_statuses.is_empty() {
+                    for (thread_id, status) in event.statuses {
+                        client.send_provider_subagent(json!({
+                            "provider": "codex",
+                            "id": thread_id.to_string(),
+                            "thread_id": thread_id.to_string(),
+                            "parent_id": event.sender_thread_id.to_string(),
+                            "status": codex_agent_status(&status),
+                            "summary": "Wait finished",
+                            "completed_at_ms": event.completed_at_ms,
+                        }));
+                    }
+                } else {
+                    for agent in event.agent_statuses {
+                        client.send_provider_subagent(json!({
+                            "provider": "codex",
+                            "id": agent.thread_id.to_string(),
+                            "thread_id": agent.thread_id.to_string(),
+                            "parent_id": event.sender_thread_id.to_string(),
+                            "name": agent.agent_nickname,
+                            "role": agent.agent_role,
+                            "status": codex_agent_status(&agent.status),
+                            "summary": "Wait finished",
+                            "completed_at_ms": event.completed_at_ms,
+                        }));
+                    }
+                }
+            }
+            EventMsg::CollabResumeBegin(event) => {
+                client.send_provider_subagent(json!({
+                    "provider": "codex",
+                    "id": event.receiver_thread_id.to_string(),
+                    "thread_id": event.receiver_thread_id.to_string(),
+                    "parent_id": event.sender_thread_id.to_string(),
+                    "name": event.receiver_agent_nickname,
+                    "role": event.receiver_agent_role,
+                    "status": "running",
+                    "summary": "Resuming",
+                    "started_at_ms": event.started_at_ms,
+                }));
+            }
+            EventMsg::CollabResumeEnd(event) => {
+                client.send_provider_subagent(json!({
+                    "provider": "codex",
+                    "id": event.receiver_thread_id.to_string(),
+                    "thread_id": event.receiver_thread_id.to_string(),
+                    "parent_id": event.sender_thread_id.to_string(),
+                    "name": event.receiver_agent_nickname,
+                    "role": event.receiver_agent_role,
+                    "status": codex_agent_status(&event.status),
+                    "summary": "Resumed",
+                    "completed_at_ms": event.completed_at_ms,
+                }));
+            }
+            EventMsg::CollabCloseBegin(event) => {
+                client.send_provider_subagent(json!({
+                    "provider": "codex",
+                    "id": event.receiver_thread_id.to_string(),
+                    "thread_id": event.receiver_thread_id.to_string(),
+                    "parent_id": event.sender_thread_id.to_string(),
+                    "status": "running",
+                    "summary": "Closing",
+                    "started_at_ms": event.started_at_ms,
+                }));
+            }
+            EventMsg::CollabCloseEnd(event) => {
+                client.send_provider_subagent(json!({
+                    "provider": "codex",
+                    "id": event.receiver_thread_id.to_string(),
+                    "thread_id": event.receiver_thread_id.to_string(),
+                    "parent_id": event.sender_thread_id.to_string(),
+                    "name": event.receiver_agent_nickname,
+                    "role": event.receiver_agent_role,
+                    "status": "closed",
+                    "summary": "Closed",
+                    "completed_at_ms": event.completed_at_ms,
+                }));
+            }
 
             // Ignore these events
             EventMsg::AgentReasoningRawContent(..)
@@ -1677,21 +1829,12 @@ impl PromptState {
             // Old events
             | EventMsg::RawResponseItem(..)
             | EventMsg::SessionConfigured(..)
-            // TODO: Subagent UI?
             | EventMsg::CollabAgentSpawnBegin(..)
-            | EventMsg::CollabAgentSpawnEnd(..)
-            | EventMsg::CollabAgentInteractionBegin(..)
-            | EventMsg::CollabAgentInteractionEnd(..)
             | EventMsg::RealtimeConversationStarted(..)
             | EventMsg::RealtimeConversationRealtime(..)
             | EventMsg::RealtimeConversationClosed(..)
             | EventMsg::RealtimeConversationSdp(..)
-            | EventMsg::CollabWaitingBegin(..)
-            | EventMsg::CollabWaitingEnd(..)
-            | EventMsg::CollabResumeBegin(..)
-            | EventMsg::CollabResumeEnd(..)
-            | EventMsg::CollabCloseBegin(..)
-            | EventMsg::CollabCloseEnd(..) => {}
+            => {}
             EventMsg::RequestUserInput(event) => {
                 info!("Request user input: {} {}", event.call_id, event.turn_id);
                 if let Err(err) = self.request_user_input(client, event)
@@ -2928,6 +3071,18 @@ fn acp_safe_text(text: String) -> String {
     format!("{}{}", &text[..end], marker)
 }
 
+fn codex_agent_status(status: &AgentStatus) -> &'static str {
+    match status {
+        AgentStatus::PendingInit => "starting",
+        AgentStatus::Running => "running",
+        AgentStatus::Interrupted => "interrupted",
+        AgentStatus::Completed(_) => "completed",
+        AgentStatus::Errored(_) => "failed",
+        AgentStatus::Shutdown => "closed",
+        AgentStatus::NotFound => "not_found",
+    }
+}
+
 #[derive(Clone)]
 struct SideChatScope {
     id: String,
@@ -3054,6 +3209,15 @@ impl SessionClient {
         {
             error!("Failed to send session notification: {:?}", e);
         }
+    }
+
+    fn send_provider_subagent(&self, subagent: serde_json::Value) {
+        self.send_notification(SessionUpdate::SessionInfoUpdate(
+            SessionInfoUpdate::new().meta(Meta::from_iter([(
+                "jaz".to_string(),
+                json!({ "providerSubagent": subagent }),
+            )])),
+        ));
     }
 
     fn send_user_message(&self, text: impl Into<String>) {
