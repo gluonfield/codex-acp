@@ -899,22 +899,26 @@ fn format_mcp_tool_approval_value(value: &serde_json::Value) -> String {
     }
 }
 
-fn format_thread_goal_update(event: &ThreadGoalUpdatedEvent) -> String {
+fn format_thread_goal_update(event: &ThreadGoalUpdatedEvent) -> Option<String> {
+    if matches!(event.goal.status, ThreadGoalStatus::Active) {
+        return None;
+    }
+
     let status = match event.goal.status {
-        ThreadGoalStatus::Active => "active",
         ThreadGoalStatus::Paused => "paused",
         ThreadGoalStatus::BudgetLimited => "budget limited",
         ThreadGoalStatus::Blocked => "blocked",
         ThreadGoalStatus::UsageLimited => "usage limited",
         ThreadGoalStatus::Complete => "complete",
+        ThreadGoalStatus::Active => unreachable!(),
     };
 
     let objective = event.goal.objective.trim();
-    if objective.contains('\n') {
+    Some(if objective.contains('\n') {
         format!("Goal updated ({status}):\n{objective}")
     } else {
         format!("Goal updated ({status}): {objective}")
-    }
+    })
 }
 
 enum SubmissionState {
@@ -1400,7 +1404,9 @@ impl PromptState {
                 info!("Thread goal updated: {:?}", event.goal.objective);
                 self.active_goal_continuation =
                     matches!(event.goal.status, ThreadGoalStatus::Active);
-                client.send_agent_text(format_thread_goal_update(&event));
+                if let Some(text) = format_thread_goal_update(&event) {
+                    client.send_agent_text(text);
+                }
             }
             EventMsg::PlanUpdate(UpdatePlanArgs { explanation, plan }) => {
                 // Send this to the client via session/update notification
@@ -4101,8 +4107,9 @@ impl<A: Auth> ThreadActor<A> {
                 self.client.send_agent_thought(text.clone());
             }
             EventMsg::ThreadGoalUpdated(event) => {
-                self.client
-                    .send_agent_text(format_thread_goal_update(event));
+                if let Some(text) = format_thread_goal_update(event) {
+                    self.client.send_agent_text(text);
+                }
             }
             // Skip other event types during replay - they either:
             // - Are transient (deltas, turn lifecycle)
@@ -5035,7 +5042,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_thread_goal_updated_is_sent_as_agent_message() -> anyhow::Result<()> {
+    async fn test_terminal_thread_goal_updated_is_sent_as_agent_message() -> anyhow::Result<()> {
         let (session_id, client, _, message_tx, _handle) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
@@ -5049,15 +5056,18 @@ mod tests {
         drop(message_tx);
 
         let notifications = client.notifications.lock().unwrap();
-        assert!(notifications.iter().any(|notification| {
-            matches!(
-                &notification.update,
+        let agent_text = notifications
+            .iter()
+            .filter_map(|notification| match &notification.update {
                 SessionUpdate::AgentMessageChunk(ContentChunk {
                     content: ContentBlock::Text(TextContent { text, .. }),
                     ..
-                }) if text == "Goal updated (active): Ship the goal update"
-            )
-        }));
+                }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!agent_text.contains(&"Goal updated (active): Ship the goal update"));
+        assert!(agent_text.contains(&"Goal updated (complete): Ship the goal update"));
 
         Ok(())
     }
