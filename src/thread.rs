@@ -929,6 +929,12 @@ impl SubmissionState {
         }
     }
 
+    fn accepts_goal_continuation(&self) -> bool {
+        match self {
+            Self::Prompt(state) => state.accepts_goal_continuation(),
+        }
+    }
+
     async fn handle_event(&mut self, client: &SessionClient, event: EventMsg) {
         match self {
             Self::Prompt(state) => state.handle_event(client, event).await,
@@ -1009,6 +1015,7 @@ struct PromptState {
     seen_message_deltas: bool,
     seen_reasoning_deltas: bool,
     plan_text_by_item: HashMap<String, String>,
+    active_goal_continuation: bool,
 }
 
 impl PromptState {
@@ -1033,11 +1040,16 @@ impl PromptState {
             seen_message_deltas: false,
             seen_reasoning_deltas: false,
             plan_text_by_item: HashMap::new(),
+            active_goal_continuation: false,
         }
     }
 
     fn is_pending(&self) -> bool {
         self.response_tx.is_some()
+    }
+
+    fn accepts_goal_continuation(&self) -> bool {
+        self.is_pending() && self.active_goal_continuation
     }
 
     fn fail(&mut self, err: Error) {
@@ -1386,6 +1398,8 @@ impl PromptState {
             }
             EventMsg::ThreadGoalUpdated(event) => {
                 info!("Thread goal updated: {:?}", event.goal.objective);
+                self.active_goal_continuation =
+                    matches!(event.goal.status, ThreadGoalStatus::Active);
                 client.send_agent_text(format_thread_goal_update(&event));
             }
             EventMsg::PlanUpdate(UpdatePlanArgs { explanation, plan }) => {
@@ -1554,6 +1568,10 @@ impl PromptState {
                     "Task {turn_id} completed successfully after {} events. Last agent message: {last_agent_message:?}",
                     self.event_count
                 );
+                if self.active_goal_continuation {
+                    info!("Task {turn_id} completed with an active goal; keeping ACP prompt open for continuation");
+                    return;
+                }
                 self.detach_pending_interactions();
                 self.finish(Ok(StopReason::EndTurn));
             }
@@ -2283,22 +2301,22 @@ impl PromptState {
             stream: _,
         } = event;
         // Stream output bytes to the display-only terminal via ToolCallUpdate meta.
-        if let Some(active_command) = self.active_commands.get(&call_id) {
-            if client.supports_terminal_output(active_command) {
-                let data_str = acp_safe_text(String::from_utf8_lossy(&chunk).to_string());
-                let update = ToolCallUpdate::new(
-                    active_command.tool_call_id.clone(),
-                    ToolCallUpdateFields::new(),
-                )
-                .meta(Meta::from_iter([(
-                    "terminal_output".to_owned(),
-                    serde_json::json!({
-                        "terminal_id": call_id,
-                        "data": data_str
-                    }),
-                )]));
-                client.send_tool_call_update(update);
-            }
+        if let Some(active_command) = self.active_commands.get(&call_id)
+            && client.supports_terminal_output(active_command)
+        {
+            let data_str = acp_safe_text(String::from_utf8_lossy(&chunk).to_string());
+            let update = ToolCallUpdate::new(
+                active_command.tool_call_id.clone(),
+                ToolCallUpdateFields::new(),
+            )
+            .meta(Meta::from_iter([(
+                "terminal_output".to_owned(),
+                serde_json::json!({
+                    "terminal_id": call_id,
+                    "data": data_str
+                }),
+            )]));
+            client.send_tool_call_update(update);
         }
     }
 
@@ -2374,21 +2392,21 @@ impl PromptState {
 
         let stdin = acp_safe_text(format!("\n{stdin}\n"));
         // Stream output bytes to the display-only terminal via ToolCallUpdate meta.
-        if let Some(active_command) = self.active_commands.get(&call_id) {
-            if client.supports_terminal_output(active_command) {
-                let update = ToolCallUpdate::new(
-                    active_command.tool_call_id.clone(),
-                    ToolCallUpdateFields::new(),
-                )
-                .meta(Meta::from_iter([(
-                    "terminal_output".to_owned(),
-                    serde_json::json!({
-                        "terminal_id": call_id,
-                        "data": stdin
-                    }),
-                )]));
-                client.send_tool_call_update(update);
-            }
+        if let Some(active_command) = self.active_commands.get(&call_id)
+            && client.supports_terminal_output(active_command)
+        {
+            let update = ToolCallUpdate::new(
+                active_command.tool_call_id.clone(),
+                ToolCallUpdateFields::new(),
+            )
+            .meta(Meta::from_iter([(
+                "terminal_output".to_owned(),
+                serde_json::json!({
+                    "terminal_id": call_id,
+                    "data": stdin
+                }),
+            )]));
+            client.send_tool_call_update(update);
         }
     }
 
@@ -4379,10 +4397,32 @@ impl<A: Auth> ThreadActor<A> {
     async fn handle_event(&mut self, Event { id, msg }: Event) {
         if let Some(submission) = self.submissions.get_mut(&id) {
             submission.handle_event(&self.client, msg).await;
+        } else if let Some(previous_id) = sole_goal_continuation_submission_id(&self.submissions) {
+            warn!(
+                "Routing event for unknown submission ID {id} to active goal continuation {previous_id}"
+            );
+            let Some(mut submission) = self.submissions.remove(&previous_id) else {
+                return;
+            };
+            submission.handle_event(&self.client, msg).await;
+            self.submissions.insert(id, submission);
         } else {
             warn!("Received event for unknown submission ID: {id} {msg:?}");
         }
     }
+}
+
+fn sole_goal_continuation_submission_id(
+    submissions: &HashMap<String, SubmissionState>,
+) -> Option<String> {
+    let ids = submissions
+        .iter()
+        .filter_map(|(id, submission)| submission.accepts_goal_continuation().then_some(id.clone()))
+        .collect::<Vec<_>>();
+    if ids.len() != 1 {
+        return None;
+    }
+    ids.into_iter().next()
 }
 
 fn build_prompt_items(prompt: Vec<ContentBlock>) -> Vec<UserInput> {
@@ -5016,6 +5056,37 @@ mod tests {
                     content: ContentBlock::Text(TextContent { text, .. }),
                     ..
                 }) if text == "Goal updated (active): Ship the goal update"
+            )
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn active_goal_continuation_keeps_prompt_stream_visible() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, _handle) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(
+                session_id.clone(),
+                vec!["active-goal-continuation".into()],
+            ),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(notifications.iter().any(|notification| {
+            matches!(
+                &notification.update,
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) if text == "continued after active goal"
             )
         }));
 
@@ -6087,9 +6158,120 @@ mod tests {
                             self.op_tx
                                 .send(Event {
                                     id: id.to_string(),
+                                    msg: EventMsg::ThreadGoalUpdated(ThreadGoalUpdatedEvent {
+                                        thread_id,
+                                        turn_id: Some(turn_id.clone()),
+                                        goal: ThreadGoal {
+                                            thread_id,
+                                            objective: "Ship the goal update".to_string(),
+                                            status: ThreadGoalStatus::Complete,
+                                            token_budget: Some(100),
+                                            tokens_used: 10,
+                                            time_used_seconds: 2,
+                                            created_at: 1,
+                                            updated_at: 3,
+                                        },
+                                    }),
+                                })
+                                .unwrap();
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
                                     msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                         last_agent_message: None,
                                         turn_id,
+                                        completed_at: None,
+                                        duration_ms: None,
+                                        time_to_first_token_ms: None,
+                                    }),
+                                })
+                                .unwrap();
+                        } else if prompt == "active-goal-continuation" {
+                            let first_turn_id = id.to_string();
+                            let continuation_id = "continuation-submission".to_string();
+                            let continuation_turn_id = "continuation-turn".to_string();
+                            let thread_id = ThreadId::default();
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg: EventMsg::ThreadGoalUpdated(ThreadGoalUpdatedEvent {
+                                        thread_id,
+                                        turn_id: Some(first_turn_id.clone()),
+                                        goal: ThreadGoal {
+                                            thread_id,
+                                            objective: "Keep going".to_string(),
+                                            status: ThreadGoalStatus::Active,
+                                            token_budget: None,
+                                            tokens_used: 10,
+                                            time_used_seconds: 2,
+                                            created_at: 1,
+                                            updated_at: 2,
+                                        },
+                                    }),
+                                })
+                                .unwrap();
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                                        last_agent_message: None,
+                                        turn_id: first_turn_id,
+                                        completed_at: None,
+                                        duration_ms: None,
+                                        time_to_first_token_ms: None,
+                                    }),
+                                })
+                                .unwrap();
+                            self.op_tx
+                                .send(Event {
+                                    id: continuation_id.clone(),
+                                    msg: EventMsg::TurnStarted(TurnStartedEvent {
+                                        model_context_window: None,
+                                        collaboration_mode_kind: ModeKind::default(),
+                                        turn_id: continuation_turn_id.clone(),
+                                        trace_id: None,
+                                        started_at: None,
+                                    }),
+                                })
+                                .unwrap();
+                            self.op_tx
+                                .send(Event {
+                                    id: continuation_id.clone(),
+                                    msg: EventMsg::AgentMessageContentDelta(
+                                        AgentMessageContentDeltaEvent {
+                                            thread_id: continuation_id.clone(),
+                                            turn_id: continuation_turn_id.clone(),
+                                            item_id: continuation_turn_id.clone(),
+                                            delta: "continued after active goal".to_string(),
+                                        },
+                                    ),
+                                })
+                                .unwrap();
+                            self.op_tx
+                                .send(Event {
+                                    id: continuation_id.clone(),
+                                    msg: EventMsg::ThreadGoalUpdated(ThreadGoalUpdatedEvent {
+                                        thread_id,
+                                        turn_id: Some(continuation_turn_id.clone()),
+                                        goal: ThreadGoal {
+                                            thread_id,
+                                            objective: "Keep going".to_string(),
+                                            status: ThreadGoalStatus::Complete,
+                                            token_budget: None,
+                                            tokens_used: 20,
+                                            time_used_seconds: 4,
+                                            created_at: 1,
+                                            updated_at: 4,
+                                        },
+                                    }),
+                                })
+                                .unwrap();
+                            self.op_tx
+                                .send(Event {
+                                    id: continuation_id,
+                                    msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                                        last_agent_message: None,
+                                        turn_id: continuation_turn_id,
                                         completed_at: None,
                                         duration_ms: None,
                                         time_to_first_token_ms: None,
