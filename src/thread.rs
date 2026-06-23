@@ -923,9 +923,9 @@ enum SubmissionState {
 }
 
 impl SubmissionState {
-    fn is_active(&self) -> bool {
+    fn is_pending(&self) -> bool {
         match self {
-            Self::Prompt(state) => state.is_active(),
+            Self::Prompt(state) => state.is_pending(),
         }
     }
 
@@ -965,10 +965,8 @@ impl SubmissionState {
     }
 
     fn fail(&mut self, err: Error) {
-        if let Self::Prompt(state) = self
-            && let Some(response_tx) = state.response_tx.take()
-        {
-            drop(response_tx.send(Err(err)));
+        match self {
+            Self::Prompt(state) => state.fail(err),
         }
     }
 }
@@ -1038,11 +1036,20 @@ impl PromptState {
         }
     }
 
-    fn is_active(&self) -> bool {
-        let Some(response_tx) = &self.response_tx else {
-            return false;
-        };
-        !response_tx.is_closed()
+    fn is_pending(&self) -> bool {
+        self.response_tx.is_some()
+    }
+
+    fn fail(&mut self, err: Error) {
+        if let Some(response_tx) = self.response_tx.take() {
+            drop(response_tx.send(Err(err)));
+        }
+    }
+
+    fn finish(&mut self, result: Result<StopReason, Error>) {
+        if let Some(response_tx) = self.response_tx.take() {
+            drop(response_tx.send(result));
+        }
     }
 
     fn detach_pending_interactions(&mut self) {
@@ -1427,10 +1434,8 @@ impl PromptState {
                     "Command execution started: call_id={}, command={:?}",
                     event.call_id, event.command
                 );
-                if let Err(err) = self.exec_approval(client, event)
-                    && let Some(response_tx) = self.response_tx.take()
-                {
-                    drop(response_tx.send(Err(err)));
+                if let Err(err) = self.exec_approval(client, event) {
+                    self.fail(err);
                 }
             }
             EventMsg::ExecCommandBegin(event) => {
@@ -1499,10 +1504,8 @@ impl PromptState {
                     "Apply patch approval request: call_id={}, reason={:?}",
                     event.call_id, event.reason
                 );
-                if let Err(err) = self.patch_approval(client, event)
-                    && let Some(response_tx) = self.response_tx.take()
-                {
-                    drop(response_tx.send(Err(err)));
+                if let Err(err) = self.patch_approval(client, event) {
+                    self.fail(err);
                 }
             }
             EventMsg::PatchApplyBegin(event) => {
@@ -1552,9 +1555,7 @@ impl PromptState {
                     self.event_count
                 );
                 self.detach_pending_interactions();
-                if let Some(response_tx) = self.response_tx.take() {
-                    response_tx.send(Ok(StopReason::EndTurn)).ok();
-                }
+                self.finish(Ok(StopReason::EndTurn));
             }
             EventMsg::StreamError(StreamErrorEvent {
                 message,
@@ -1571,27 +1572,18 @@ impl PromptState {
             }) => {
                 error!("Unhandled error during turn: {message} {codex_error_info:?}");
                 self.detach_pending_interactions();
-                if let Some(response_tx) = self.response_tx.take() {
-                    response_tx
-                        .send(Err(Error::internal_error().data(
-                            json!({ "message": message, "codex_error_info": codex_error_info }),
-                        )))
-                        .ok();
-                }
+                self.finish(Err(Error::internal_error()
+                    .data(json!({ "message": message, "codex_error_info": codex_error_info }))));
             }
             EventMsg::TurnAborted(TurnAbortedEvent { reason, turn_id, completed_at: _, duration_ms: _ }) => {
                 info!("Turn {turn_id:?} aborted: {reason:?}");
                 self.detach_pending_interactions();
-                if let Some(response_tx) = self.response_tx.take() {
-                    response_tx.send(Ok(StopReason::Cancelled)).ok();
-                }
+                self.finish(Ok(StopReason::Cancelled));
             }
             EventMsg::ShutdownComplete => {
                 info!("Agent shutting down");
                 self.detach_pending_interactions();
-                if let Some(response_tx) = self.response_tx.take() {
-                    response_tx.send(Ok(StopReason::Cancelled)).ok();
-                }
+                self.finish(Ok(StopReason::Cancelled));
             }
             EventMsg::ViewImageToolCall(ViewImageToolCallEvent { call_id, path }) => {
                 info!("ViewImageToolCallEvent received");
@@ -1610,10 +1602,8 @@ impl PromptState {
             }
             EventMsg::ExitedReviewMode(event) => {
                 info!("Review end: output={event:?}");
-                if let Err(err) = self.review_mode_exit(client, event)
-                    && let Some(response_tx) = self.response_tx.take()
-                {
-                    drop(response_tx.send(Err(err)));
+                if let Err(err) = self.review_mode_exit(client, event) {
+                    self.fail(err);
                 }
             }
             EventMsg::Warning(WarningEvent { message })
@@ -1637,10 +1627,8 @@ impl PromptState {
             }
             EventMsg::ElicitationRequest(event) => {
                 info!("Elicitation request: server={}, id={:?}", event.server_name, event.id);
-                if let Err(err) = self.mcp_elicitation(client, event).await
-                    && let Some(response_tx) = self.response_tx.take()
-                {
-                    drop(response_tx.send(Err(err)));
+                if let Err(err) = self.mcp_elicitation(client, event).await {
+                    self.fail(err);
                 }
             }
             EventMsg::ModelReroute(ModelRerouteEvent { from_model, to_model, reason }) => {
@@ -1656,10 +1644,8 @@ impl PromptState {
             }
             EventMsg::RequestPermissions(event) => {
                 info!("Request permissions: {} {}", event.call_id, event.turn_id);
-                if let Err(err) = self.request_permissions(client, event)
-                    && let Some(response_tx) = self.response_tx.take()
-                {
-                    drop(response_tx.send(Err(err)));
+                if let Err(err) = self.request_permissions(client, event) {
+                    self.fail(err);
                 }
             }
             EventMsg::GuardianAssessment(event) => {
@@ -1697,10 +1683,8 @@ impl PromptState {
             => {}
             EventMsg::RequestUserInput(event) => {
                 info!("Request user input: {} {}", event.call_id, event.turn_id);
-                if let Err(err) = self.request_user_input(client, event)
-                    && let Some(response_tx) = self.response_tx.take()
-                {
-                    drop(response_tx.send(Err(err)));
+                if let Err(err) = self.request_user_input(client, event) {
+                    self.fail(err);
                 }
             }
             e @ (EventMsg::RealtimeConversationListVoicesResponse(..)
@@ -3257,9 +3241,8 @@ impl<A: Auth> ThreadActor<A> {
                     }
                 }
             }
-            // Litter collection of senders with no receivers
             self.submissions
-                .retain(|_, submission| submission.is_active());
+                .retain(|_, submission| submission.is_pending());
 
             if !message_rx_open && self.submissions.is_empty() && self.side_submissions.is_empty() {
                 for side_chat_id in self.side_threads.keys().cloned().collect::<Vec<_>>() {
@@ -3394,7 +3377,7 @@ impl<A: Auth> ThreadActor<A> {
         };
 
         side.submission.handle_event(&side.client, event.msg).await;
-        if !side.submission.is_active() {
+        if !side.submission.is_pending() {
             self.side_submissions.remove(&submission_id);
         }
     }
@@ -4937,6 +4920,76 @@ mod tests {
                 ..
             }) if text == "Hi"
         ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prompt_stream_survives_dropped_stop_receiver() -> anyhow::Result<()> {
+        let (session_id, client, thread, message_tx, handle) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["hold-open".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason_rx =
+            tokio::time::timeout(Duration::from_secs(2), prompt_response_rx).await???;
+        drop(stop_reason_rx);
+
+        let (config_tx, config_rx) = tokio::sync::oneshot::channel();
+        message_tx.send(ThreadMessage::GetConfigOptions {
+            response_tx: config_tx,
+        })?;
+        tokio::time::timeout(Duration::from_secs(2), config_rx).await???;
+
+        thread.op_tx.send(Event {
+            id: "0".to_string(),
+            msg: EventMsg::AgentMessageContentDelta(AgentMessageContentDeltaEvent {
+                thread_id: "0".to_string(),
+                turn_id: "0".to_string(),
+                item_id: "0".to_string(),
+                delta: "still visible".to_string(),
+            }),
+        })?;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if client
+                    .notifications
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|notification| {
+                        matches!(
+                            &notification.update,
+                            SessionUpdate::AgentMessageChunk(ContentChunk {
+                                content: ContentBlock::Text(TextContent { text, .. }),
+                                ..
+                            }) if text == "still visible"
+                        )
+                    })
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+
+        thread.op_tx.send(Event {
+            id: "0".to_string(),
+            msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                last_agent_message: None,
+                turn_id: "0".to_string(),
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        })?;
+        drop(message_tx);
+        tokio::time::timeout(Duration::from_secs(2), handle).await??;
 
         Ok(())
     }
