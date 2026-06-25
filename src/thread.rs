@@ -10,16 +10,16 @@ use std::{
 use agent_client_protocol::{
     Client, ConnectionTo, Error,
     schema::{
-        AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, ClientCapabilities,
-        ConfigOptionUpdate, Content, ContentBlock, ContentChunk, Diff, EmbeddedResource,
-        EmbeddedResourceResource, ImageContent, LoadSessionResponse, Meta, PermissionOption,
-        PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest,
-        RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-        ResourceLink, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
-        SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
-        SessionConfigValueId, SessionId, SessionInfoUpdate, SessionMode, SessionModeId,
-        SessionModeState, SessionNotification, SessionUpdate, StopReason, Terminal, TextContent,
-        TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation,
+        AgentNotification, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
+        ClientCapabilities, ConfigOptionUpdate, Content, ContentBlock, ContentChunk, Diff,
+        EmbeddedResource, EmbeddedResourceResource, ImageContent, LoadSessionResponse, Meta,
+        PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
+        PlanEntryStatus, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
+        RequestPermissionResponse, ResourceLink, SelectedPermissionOutcome, SessionConfigId,
+        SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
+        SessionConfigSelectOption, SessionConfigValueId, SessionId, SessionInfoUpdate, SessionMode,
+        SessionModeId, SessionModeState, SessionNotification, SessionUpdate, StopReason, Terminal,
+        TextContent, TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation,
         ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
         UsageUpdate,
     },
@@ -91,12 +91,13 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::developer_instructions::append_developer_instructions;
+use crate::{developer_instructions::append_developer_instructions, jaz_extensions};
 
 /// Abstraction over the ACP connection for sending notifications and requests
 /// back to the client. This replaces the old `Client` trait usage.
 trait ClientSender: Send + Sync + 'static {
     fn send_session_notification(&self, notif: SessionNotification) -> Result<(), Error>;
+    fn send_agent_notification(&self, notif: AgentNotification) -> Result<(), Error>;
     fn request_permission(
         &self,
         req: RequestPermissionRequest,
@@ -108,6 +109,10 @@ struct AcpConnection(ConnectionTo<Client>);
 
 impl ClientSender for AcpConnection {
     fn send_session_notification(&self, notif: SessionNotification) -> Result<(), Error> {
+        self.0.send_notification(notif)
+    }
+
+    fn send_agent_notification(&self, notif: AgentNotification) -> Result<(), Error> {
         self.0.send_notification(notif)
     }
 
@@ -899,28 +904,6 @@ fn format_mcp_tool_approval_value(value: &serde_json::Value) -> String {
     }
 }
 
-fn format_thread_goal_update(event: &ThreadGoalUpdatedEvent) -> Option<String> {
-    if matches!(event.goal.status, ThreadGoalStatus::Active) {
-        return None;
-    }
-
-    let status = match event.goal.status {
-        ThreadGoalStatus::Paused => "paused",
-        ThreadGoalStatus::BudgetLimited => "budget limited",
-        ThreadGoalStatus::Blocked => "blocked",
-        ThreadGoalStatus::UsageLimited => "usage limited",
-        ThreadGoalStatus::Complete => "complete",
-        ThreadGoalStatus::Active => unreachable!(),
-    };
-
-    let objective = event.goal.objective.trim();
-    Some(if objective.contains('\n') {
-        format!("Goal updated ({status}):\n{objective}")
-    } else {
-        format!("Goal updated ({status}): {objective}")
-    })
-}
-
 enum SubmissionState {
     /// User prompts, including slash commands like /init, /review, /compact.
     Prompt(PromptState),
@@ -1402,9 +1385,10 @@ impl PromptState {
             }
             EventMsg::ThreadGoalUpdated(event) => {
                 info!("Thread goal updated: {:?}", event.goal.objective);
+                client.send_thread_goal_update(&event);
                 self.active_goal_continuation =
                     matches!(event.goal.status, ThreadGoalStatus::Active);
-                if let Some(text) = format_thread_goal_update(&event) {
+                if let Some(text) = jaz_extensions::format_thread_goal_update(&event) {
                     client.send_agent_text(text);
                 }
             }
@@ -1664,6 +1648,7 @@ impl PromptState {
 
             EventMsg::ContextCompacted(..) => {
                 info!("Context compacted");
+                client.send_context_compacted();
                 client.send_agent_text("Context compacted\n".to_string());
             }
             EventMsg::RequestPermissions(event) => {
@@ -3067,12 +3052,34 @@ impl SessionClient {
         }
     }
 
+    fn send_ext_notification(&self, notification: Option<AgentNotification>) {
+        let Some(notification) = notification else {
+            return;
+        };
+        if let Err(e) = self.client.send_agent_notification(notification) {
+            error!("Failed to send extension notification: {:?}", e);
+        }
+    }
+
+    fn send_context_compacted(&self) {
+        self.send_ext_notification(jaz_extensions::context_compacted_notification(
+            &self.session_id,
+        ));
+    }
+
     fn send_provider_subagent(&self, subagent: serde_json::Value) {
         self.send_notification(SessionUpdate::SessionInfoUpdate(
             SessionInfoUpdate::new().meta(Meta::from_iter([(
                 "jaz".to_string(),
                 json!({ "providerSubagent": subagent }),
             )])),
+        ));
+    }
+
+    fn send_thread_goal_update(&self, event: &ThreadGoalUpdatedEvent) {
+        self.send_ext_notification(jaz_extensions::thread_goal_update_notification(
+            &self.session_id,
+            event,
         ));
     }
 
@@ -3750,6 +3757,7 @@ impl<A: Auth> ThreadActor<A> {
         let (response_tx, response_rx) = oneshot::channel();
 
         let side_scope = side_prompt_scope(request.meta.as_ref());
+        let goal_requested = jaz_extensions::goal_requested(request.meta.as_ref());
         let items = build_prompt_items(request.prompt);
         if let Some(scope) = side_scope {
             return self
@@ -3828,25 +3836,11 @@ impl<A: Auth> ThreadActor<A> {
                     return Err(Error::auth_required());
                 }
                 _ => {
-                    op = Op::UserInput {
-                        items,
-                        final_output_json_schema: None,
-                        environments: None,
-                        responsesapi_client_metadata: None,
-                        additional_context: Default::default(),
-                        thread_settings: Default::default(),
-                    }
+                    op = jaz_extensions::user_input_op(items, goal_requested);
                 }
             }
         } else {
-            op = Op::UserInput {
-                items,
-                final_output_json_schema: None,
-                environments: None,
-                responsesapi_client_metadata: None,
-                additional_context: Default::default(),
-                thread_settings: Default::default(),
-            }
+            op = jaz_extensions::user_input_op(items, goal_requested);
         }
 
         let submission_id = self
@@ -3929,7 +3923,11 @@ impl<A: Auth> ThreadActor<A> {
             items
         };
 
-        let submission_id = match side.thread.submit(user_input_op(items)).await {
+        let submission_id = match side
+            .thread
+            .submit(jaz_extensions::user_input_op(items, false))
+            .await
+        {
             Ok(submission_id) => submission_id,
             Err(err) => {
                 if new_side_thread {
@@ -4107,7 +4105,8 @@ impl<A: Auth> ThreadActor<A> {
                 self.client.send_agent_thought(text.clone());
             }
             EventMsg::ThreadGoalUpdated(event) => {
-                if let Some(text) = format_thread_goal_update(event) {
+                self.client.send_thread_goal_update(event);
+                if let Some(text) = jaz_extensions::format_thread_goal_update(event) {
                     self.client.send_agent_text(text);
                 }
             }
@@ -4467,17 +4466,6 @@ fn build_prompt_items(prompt: Vec<ContentBlock>) -> Vec<UserInput> {
             ContentBlock::Audio(..) | ContentBlock::Resource(..) | _ => None,
         })
         .collect()
-}
-
-fn user_input_op(items: Vec<UserInput>) -> Op {
-    Op::UserInput {
-        items,
-        final_output_json_schema: None,
-        environments: None,
-        responsesapi_client_metadata: None,
-        additional_context: Default::default(),
-        thread_settings: Default::default(),
-    }
 }
 
 fn build_side_prompt_items(
@@ -4972,6 +4960,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn goal_requested_meta_adds_application_context() -> anyhow::Result<()> {
+        let (session_id, _, thread, message_tx, _handle) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["hold-open".into()]).meta(
+                Meta::from_iter([(
+                    "jaz".to_string(),
+                    serde_json::json!({ "goalRequested": true }),
+                )]),
+            ),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason_rx =
+            tokio::time::timeout(Duration::from_secs(2), prompt_response_rx).await???;
+        {
+            let ops = thread.ops.lock().unwrap();
+            let Some(Op::UserInput {
+                items,
+                additional_context,
+                ..
+            }) = ops.first()
+            else {
+                anyhow::bail!("expected user input op, got {ops:?}");
+            };
+            assert!(matches!(
+                items.first(),
+                Some(UserInput::Text { text, .. }) if text == "hold-open"
+            ));
+            let entry = additional_context
+                .get("jaz.goal_request")
+                .expect("goal request context");
+            assert!(matches!(
+                entry.kind,
+                codex_protocol::protocol::AdditionalContextKind::Application
+            ));
+            assert!(entry.value.contains("native Codex goal support"));
+        }
+
+        thread.op_tx.send(Event {
+            id: "0".to_string(),
+            msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                last_agent_message: None,
+                turn_id: "0".to_string(),
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        })?;
+        let stop_reason = tokio::time::timeout(Duration::from_secs(2), stop_reason_rx).await???;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn prompt_stream_survives_dropped_stop_receiver() -> anyhow::Result<()> {
         let (session_id, client, thread, message_tx, handle) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
@@ -5068,6 +5114,38 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!agent_text.contains(&"Goal updated (active): Ship the goal update"));
         assert!(agent_text.contains(&"Goal updated (complete): Ship the goal update"));
+
+        drop(notifications);
+
+        let agent_notifications = client.agent_notifications.lock().unwrap();
+        let goal_updates = agent_notifications
+            .iter()
+            .filter_map(|notification| match notification {
+                AgentNotification::ExtNotification(update)
+                    if update.method.as_ref() == jaz_extensions::GOAL_UPDATE_METHOD =>
+                {
+                    Some(
+                        serde_json::from_str::<serde_json::Value>(update.params.get())
+                            .expect("goal update JSON"),
+                    )
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(goal_updates.len(), 2);
+        assert_eq!(
+            goal_updates[0]["goal"]["status"],
+            serde_json::json!("active")
+        );
+        assert_eq!(
+            goal_updates[1]["goal"]["status"],
+            serde_json::json!("complete")
+        );
+        assert_eq!(
+            goal_updates[1]["goal"]["tokenBudget"],
+            serde_json::json!(100)
+        );
+        assert_eq!(goal_updates[1]["goal"]["tokensUsed"], serde_json::json!(10));
 
         Ok(())
     }
@@ -5207,6 +5285,36 @@ mod tests {
         assert_eq!(ops.as_slice(), &[Op::Compact]);
 
         Ok(())
+    }
+
+    #[test]
+    fn context_compacted_extension_payload() {
+        let session_id = SessionId::new("test");
+        let client = Arc::new(StubClient::new());
+        let session_client =
+            SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
+
+        session_client.send_context_compacted();
+
+        let notifications = client.agent_notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1);
+        let AgentNotification::ExtNotification(notification) = &notifications[0] else {
+            panic!("expected extension notification");
+        };
+        assert_eq!(
+            notification.method.as_ref(),
+            jaz_extensions::CONTEXT_COMPACTED_METHOD
+        );
+        let payload: serde_json::Value = serde_json::from_str(notification.params.get()).unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "sessionId": session_id,
+                "source": "codex",
+                "status": "completed",
+                "trigger": "manual",
+            })
+        );
     }
 
     #[test]
@@ -6514,6 +6622,7 @@ mod tests {
 
     struct StubClient {
         notifications: std::sync::Mutex<Vec<SessionNotification>>,
+        agent_notifications: std::sync::Mutex<Vec<AgentNotification>>,
         permission_requests: std::sync::Mutex<Vec<RequestPermissionRequest>>,
         permission_responses: std::sync::Mutex<VecDeque<RequestPermissionResponse>>,
         block_permission_requests: Option<Arc<Notify>>,
@@ -6523,6 +6632,7 @@ mod tests {
         fn new() -> Self {
             StubClient {
                 notifications: std::sync::Mutex::default(),
+                agent_notifications: std::sync::Mutex::default(),
                 permission_requests: std::sync::Mutex::default(),
                 permission_responses: std::sync::Mutex::default(),
                 block_permission_requests: None,
@@ -6532,6 +6642,7 @@ mod tests {
         fn with_permission_responses(responses: Vec<RequestPermissionResponse>) -> Self {
             StubClient {
                 notifications: std::sync::Mutex::default(),
+                agent_notifications: std::sync::Mutex::default(),
                 permission_requests: std::sync::Mutex::default(),
                 permission_responses: std::sync::Mutex::new(responses.into()),
                 block_permission_requests: None,
@@ -6544,6 +6655,7 @@ mod tests {
         ) -> Self {
             StubClient {
                 notifications: std::sync::Mutex::default(),
+                agent_notifications: std::sync::Mutex::default(),
                 permission_requests: std::sync::Mutex::default(),
                 permission_responses: std::sync::Mutex::new(responses.into()),
                 block_permission_requests: Some(notify),
@@ -6554,6 +6666,11 @@ mod tests {
     impl ClientSender for StubClient {
         fn send_session_notification(&self, args: SessionNotification) -> Result<(), Error> {
             self.notifications.lock().unwrap().push(args);
+            Ok(())
+        }
+
+        fn send_agent_notification(&self, args: AgentNotification) -> Result<(), Error> {
+            self.agent_notifications.lock().unwrap().push(args);
             Ok(())
         }
 

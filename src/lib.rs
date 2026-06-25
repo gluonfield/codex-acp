@@ -12,6 +12,7 @@ use tracing_subscriber::EnvFilter;
 mod codex_agent;
 mod collab_subagents;
 mod developer_instructions;
+mod jaz_extensions;
 mod thread;
 
 /// Run the Codex ACP agent.
