@@ -21,6 +21,7 @@ use codex_core::{
 use codex_exec_server::{EnvironmentManager, ExecServerRuntimePaths};
 use codex_extension_api::empty_extension_registry;
 use codex_features::Feature;
+use codex_home::CodexHomeUserInstructionsProvider;
 use codex_login::{
     CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR,
     auth::{AuthManager, CodexAuth, read_codex_api_key_from_env, read_openai_api_key_from_env},
@@ -33,6 +34,7 @@ use codex_thread_store::{
     ListThreadsParams, SortDirection as StoreSortDirection, ThreadSortKey as StoreThreadSortKey,
     ThreadStore,
 };
+use codex_utils_path_uri::LegacyAppPathString;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -76,13 +78,7 @@ impl CodexAgent {
         config: Config,
         codex_linux_sandbox_exe: Option<PathBuf>,
     ) -> std::io::Result<Self> {
-        let auth_manager = AuthManager::shared(
-            config.codex_home.to_path_buf(),
-            false,
-            config.cli_auth_credentials_store_mode,
-            Some(config.chatgpt_base_url.clone()),
-        )
-        .await;
+        let auth_manager = AuthManager::shared_from_config(&config, false).await;
 
         let client_capabilities: Arc<Mutex<ClientCapabilities>> = Arc::default();
         let session_roots: Arc<Mutex<HashMap<SessionId, PathBuf>>> = Arc::default();
@@ -96,16 +92,21 @@ impl CodexAgent {
         );
         let thread_store = thread_store_from_config(&config, state_db.clone());
         let installation_id = resolve_installation_id(&config.codex_home).await?;
+        let user_instructions_provider = Arc::new(CodexHomeUserInstructionsProvider::new(
+            config.codex_home.clone(),
+        ));
         let thread_manager = Arc::new(ThreadManager::new(
             &config,
             auth_manager.clone(),
             SessionSource::Unknown,
             environment_manager,
             empty_extension_registry(),
+            user_instructions_provider,
             None,
             thread_store.clone(),
             state_db.clone(),
             installation_id,
+            None,
             None,
         ));
         Ok(Self {
@@ -410,7 +411,7 @@ impl CodexAgent {
                                     Some(env.into_iter().map(|env| (env.name, env.value)).collect())
                                 },
                                 env_vars: vec![],
-                                cwd: Some(cwd.to_path_buf()),
+                                cwd: Some(LegacyAppPathString::from_abs_path(&cwd)),
                             },
                             required: false,
                             enabled: true,
@@ -514,6 +515,8 @@ impl CodexAgent {
                     codex_login::auth::CLIENT_ID.to_string(),
                     None,
                     self.config.cli_auth_credentials_store_mode,
+                    self.config.auth_keyring_backend_kind(),
+                    self.config.auth_route_config(),
                 );
 
                 let server =
@@ -532,6 +535,7 @@ impl CodexAgent {
                     &self.config.codex_home,
                     &api_key,
                     self.config.cli_auth_credentials_store_mode,
+                    self.config.auth_keyring_backend_kind(),
                 )
                 .map_err(Error::into_internal_error)?;
             }
@@ -543,6 +547,7 @@ impl CodexAgent {
                     &self.config.codex_home,
                     &api_key,
                     self.config.cli_auth_credentials_store_mode,
+                    self.config.auth_keyring_backend_kind(),
                 )
                 .map_err(Error::into_internal_error)?;
             }
@@ -712,6 +717,7 @@ impl CodexAgent {
             rollout_path.clone(),
             self.auth_manager.clone(),
             None,
+            false,
         ))
         .await
         .map_err(|e| Error::internal_error().data(e.to_string()))?;
@@ -772,6 +778,7 @@ impl CodexAgent {
                 cwd_filters: cwd.map(|cwd| vec![cwd]),
                 archived: false,
                 search_term: None,
+                parent_thread_id: None,
                 use_state_db_only: false,
             })
             .await

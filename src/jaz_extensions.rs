@@ -43,7 +43,6 @@ pub(crate) fn user_input_op(items: Vec<UserInput>, goal_requested: bool) -> Op {
     Op::UserInput {
         items,
         final_output_json_schema: None,
-        environments: None,
         responsesapi_client_metadata: None,
         additional_context,
         thread_settings: Default::default(),

@@ -294,6 +294,7 @@ impl ThreadForker for ThreadManager {
                 history,
                 Some(ThreadSource::User),
                 None,
+                false,
             )
             .await?;
             let thread: Arc<dyn CodexThreadImpl> = forked.thread;
@@ -1689,6 +1690,11 @@ impl PromptState {
             | EventMsg::RealtimeConversationRealtime(..)
             | EventMsg::RealtimeConversationClosed(..)
             | EventMsg::RealtimeConversationSdp(..)
+            // First-party turn-presentation/safety metadata and sub-agent
+            // activity signals with no ACP surface.
+            | EventMsg::TurnModerationMetadata(..)
+            | EventMsg::SafetyBuffering(..)
+            | EventMsg::SubAgentActivity(..)
             => {}
             EventMsg::RequestUserInput(event) => {
                 info!("Request user input: {} {}", event.call_id, event.turn_id);
@@ -1809,6 +1815,7 @@ impl PromptState {
 
         let request_kind = match &request {
             ElicitationRequest::Form { .. } => "form",
+            ElicitationRequest::OpenAiForm { .. } => "openai_form",
             ElicitationRequest::Url { .. } => "url",
         };
 
@@ -2247,7 +2254,7 @@ impl PromptState {
             locations,
             terminal_output,
             kind,
-        } = parse_command_tool_call(parsed_cmd, &cwd);
+        } = parse_command_tool_call(parsed_cmd, &cwd.to_path_buf());
 
         let active_command = ActiveCommand {
             tool_call_id: tool_call_id.clone(),
@@ -2260,7 +2267,7 @@ impl PromptState {
                 "terminal_info".to_owned(),
                 serde_json::json!({
                     "terminal_id": call_id,
-                    "cwd": cwd
+                    "cwd": cwd.to_path_buf()
                 }),
             )]));
             (content, meta)
@@ -3500,7 +3507,7 @@ impl<A: Auth> ThreadActor<A> {
             mode: self.current_collaboration_mode,
             settings: Settings {
                 model: self.get_current_model().await,
-                reasoning_effort: self.config.model_reasoning_effort,
+                reasoning_effort: self.config.model_reasoning_effort.clone(),
                 developer_instructions: None,
             },
         };
@@ -3511,9 +3518,9 @@ impl<A: Auth> ThreadActor<A> {
             .expect("Codex should ship Default and Plan collaboration mode presets");
 
         if kind == ModeKind::Plan
-            && let Some(effort) = self.config.plan_mode_reasoning_effort
+            && let Some(effort) = self.config.plan_mode_reasoning_effort.as_ref()
         {
-            mask.reasoning_effort = Some(Some(effort));
+            mask.reasoning_effort = Some(Some(effort.clone()));
         }
 
         let mut collaboration_mode = base.apply_mask(&mask);
@@ -3589,12 +3596,13 @@ impl<A: Auth> ThreadActor<A> {
             let current_effort = self
                 .config
                 .model_reasoning_effort
+                .as_ref()
                 .and_then(|effort| {
                     supported
                         .iter()
-                        .find_map(|e| (e.effort == effort).then_some(effort))
+                        .find_map(|e| (&e.effort == effort).then(|| effort.clone()))
                 })
-                .unwrap_or(preset.default_reasoning_effort);
+                .unwrap_or_else(|| preset.default_reasoning_effort.clone());
 
             let effort_select_options = supported
                 .iter()
@@ -3672,27 +3680,27 @@ impl<A: Auth> ThreadActor<A> {
         }
 
         let effort_to_use = if let Some(preset) = preset {
-            if let Some(effort) = self.config.model_reasoning_effort
+            if let Some(effort) = self.config.model_reasoning_effort.as_ref()
                 && preset
                     .supported_reasoning_efforts
                     .iter()
-                    .any(|e| e.effort == effort)
+                    .any(|e| &e.effort == effort)
             {
-                Some(effort)
+                Some(effort.clone())
             } else {
-                Some(preset.default_reasoning_effort)
+                Some(preset.default_reasoning_effort.clone())
             }
         } else {
             // If the user selected a raw model string (not a known preset), don't invent a default.
             // Keep whatever was previously configured (or leave unset) so Codex can decide.
-            self.config.model_reasoning_effort
+            self.config.model_reasoning_effort.clone()
         };
 
         self.thread
             .submit(Op::ThreadSettings {
                 thread_settings: ThreadSettingsOverrides {
                     model: Some(model_to_use.clone()),
-                    effort: Some(effort_to_use),
+                    effort: Some(effort_to_use.clone()),
                     ..Default::default()
                 },
             })
@@ -3732,7 +3740,7 @@ impl<A: Auth> ThreadActor<A> {
         self.thread
             .submit(Op::ThreadSettings {
                 thread_settings: ThreadSettingsOverrides {
-                    effort: Some(Some(effort)),
+                    effort: Some(Some(effort.clone())),
                     ..Default::default()
                 },
             })
@@ -3785,7 +3793,6 @@ impl<A: Auth> ThreadActor<A> {
                             text_elements: vec![],
                         }],
                         final_output_json_schema: None,
-                        environments: None,
                         responsesapi_client_metadata: None,
                         additional_context: Default::default(),
                         thread_settings: Default::default(),
@@ -4281,7 +4288,9 @@ impl<A: Auth> ThreadActor<A> {
                     serde_json::from_str(arguments).ok(),
                 );
             }
-            ResponseItem::FunctionCallOutput { call_id, output } => {
+            ResponseItem::FunctionCallOutput {
+                call_id, output, ..
+            } => {
                 self.client
                     .send_tool_call_completed(call_id.clone(), serde_json::to_value(output).ok());
             }
@@ -4357,6 +4366,7 @@ impl<A: Auth> ThreadActor<A> {
                 name: _,
                 call_id,
                 output,
+                ..
             } => {
                 self.client
                     .send_tool_call_completed(call_id.clone(), Some(serde_json::json!(output)));
@@ -4378,9 +4388,13 @@ impl<A: Auth> ThreadActor<A> {
                 status,
                 revised_prompt,
                 result,
+                ..
             } => {
+                let id = id
+                    .clone()
+                    .unwrap_or_else(|| generate_fallback_id("image_generation"));
                 self.client.send_tool_call(
-                    ToolCall::new(id.clone(), "Image generation")
+                    ToolCall::new(id, "Image generation")
                         .kind(ToolKind::Other)
                         .status(image_generation_tool_status(status))
                         .content(image_generation_content(
