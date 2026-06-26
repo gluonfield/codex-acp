@@ -17,7 +17,11 @@ filedescriptor = "0.8.3"
 lazy_static = "1"
 log = "0.4"
 shared_library = "0.1.9"
+# "std" aliases winapi's c_void to std::ffi::c_void so PsuedoCon::raw_handle()
+# (HANDLE) satisfies the std RawHandle return type. In codex's workspace this is
+# enabled transitively; this standalone vendored crate must opt in explicitly.
 winapi = { version = "0.3.9", features = [
+    "std",
     "handleapi",
     "minwinbase",
     "processthreadsapi",
