@@ -511,7 +511,7 @@ impl CodexAgent {
             .list(SessionListCapabilities::new())
             .resume(SessionResumeCapabilities::new());
         agent_capabilities.meta = Some(Meta::from_iter([(
-            "jaz".to_string(),
+            "codex".to_string(),
             serde_json::json!({ "nativeGoal": true }),
         )]));
 

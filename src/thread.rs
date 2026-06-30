@@ -95,7 +95,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::{developer_instructions::append_developer_instructions, jaz_extensions};
+use crate::{codex_extensions, developer_instructions::append_developer_instructions};
 
 /// Abstraction over the ACP connection for sending notifications and requests
 /// back to the client. This replaces the old `Client` trait usage.
@@ -1476,7 +1476,7 @@ impl PromptState {
                 client.send_thread_goal_update(&event);
                 self.active_goal_continuation =
                     matches!(event.goal.status, ThreadGoalStatus::Active);
-                if let Some(text) = jaz_extensions::format_thread_goal_update(&event) {
+                if let Some(text) = codex_extensions::format_thread_goal_update(&event) {
                     client.send_agent_text(text);
                 }
             }
@@ -3156,7 +3156,7 @@ impl SessionClient {
     }
 
     fn send_context_compacted(&self) {
-        self.send_ext_notification(jaz_extensions::context_compacted_notification(
+        self.send_ext_notification(codex_extensions::context_compacted_notification(
             &self.session_id,
         ));
     }
@@ -3164,14 +3164,14 @@ impl SessionClient {
     fn send_provider_subagent(&self, subagent: serde_json::Value) {
         self.send_notification(SessionUpdate::SessionInfoUpdate(
             SessionInfoUpdate::new().meta(Meta::from_iter([(
-                "jaz".to_string(),
+                "codex".to_string(),
                 json!({ "providerSubagent": subagent }),
             )])),
         ));
     }
 
     fn send_thread_goal_update(&self, event: &ThreadGoalUpdatedEvent) {
-        self.send_ext_notification(jaz_extensions::thread_goal_update_notification(
+        self.send_ext_notification(codex_extensions::thread_goal_update_notification(
             &self.session_id,
             event,
         ));
@@ -3861,7 +3861,7 @@ impl<A: Auth> ThreadActor<A> {
         let (response_tx, response_rx) = oneshot::channel();
 
         let side_scope = side_prompt_scope(request.meta.as_ref());
-        let goal_request = jaz_extensions::goal_request(request.meta.as_ref());
+        let goal_request = codex_extensions::goal_request(request.meta.as_ref());
         let items = build_prompt_items(request.prompt);
         if let Some(scope) = side_scope {
             return self
@@ -3941,12 +3941,12 @@ impl<A: Auth> ThreadActor<A> {
                 }
                 _ => {
                     submit_goal_request = goal_request.is_some();
-                    op = jaz_extensions::user_input_op(items, submit_goal_request);
+                    op = codex_extensions::user_input_op(items, submit_goal_request);
                 }
             }
         } else {
             submit_goal_request = goal_request.is_some();
-            op = jaz_extensions::user_input_op(items, submit_goal_request);
+            op = codex_extensions::user_input_op(items, submit_goal_request);
         }
 
         let seeded_active_goal = if submit_goal_request {
@@ -4051,7 +4051,7 @@ impl<A: Auth> ThreadActor<A> {
 
         let submission_id = match side
             .thread
-            .submit(jaz_extensions::user_input_op(items, false))
+            .submit(codex_extensions::user_input_op(items, false))
             .await
         {
             Ok(submission_id) => submission_id,
@@ -4232,7 +4232,7 @@ impl<A: Auth> ThreadActor<A> {
             }
             EventMsg::ThreadGoalUpdated(event) => {
                 self.client.send_thread_goal_update(event);
-                if let Some(text) = jaz_extensions::format_thread_goal_update(event) {
+                if let Some(text) = codex_extensions::format_thread_goal_update(event) {
                     self.client.send_agent_text(text);
                 }
             }
@@ -5105,10 +5105,12 @@ mod tests {
         message_tx.send(ThreadMessage::Prompt {
             request: PromptRequest::new(session_id.clone(), vec!["hold-open".into()]).meta(
                 Meta::from_iter([(
-                    "jaz".to_string(),
+                    "codex".to_string(),
                     serde_json::json!({
-                        "goalRequested": true,
-                        "goalObjective": "  Ship native goal mode  ",
+                        "goal": {
+                            "requested": true,
+                            "objective": "  Ship native goal mode  "
+                        },
                     }),
                 )]),
             ),
@@ -5132,7 +5134,7 @@ mod tests {
                 Some(UserInput::Text { text, .. }) if text == "hold-open"
             ));
             let entry = additional_context
-                .get("jaz.goal_request")
+                .get("codex.goal_request")
                 .expect("goal request context");
             assert!(matches!(
                 entry.kind,
@@ -5150,7 +5152,7 @@ mod tests {
                 .iter()
                 .find_map(|notification| match notification {
                     AgentNotification::ExtNotification(update)
-                        if update.method.as_ref() == jaz_extensions::GOAL_UPDATE_METHOD =>
+                        if update.method.as_ref() == codex_extensions::GOAL_UPDATE_METHOD =>
                     {
                         Some(
                             serde_json::from_str::<serde_json::Value>(update.params.get())
@@ -5306,7 +5308,7 @@ mod tests {
             .iter()
             .filter_map(|notification| match notification {
                 AgentNotification::ExtNotification(update)
-                    if update.method.as_ref() == jaz_extensions::GOAL_UPDATE_METHOD =>
+                    if update.method.as_ref() == codex_extensions::GOAL_UPDATE_METHOD =>
                 {
                     Some(
                         serde_json::from_str::<serde_json::Value>(update.params.get())
@@ -5487,7 +5489,7 @@ mod tests {
         };
         assert_eq!(
             notification.method.as_ref(),
-            jaz_extensions::CONTEXT_COMPACTED_METHOD
+            codex_extensions::CONTEXT_COMPACTED_METHOD
         );
         let payload: serde_json::Value = serde_json::from_str(notification.params.get()).unwrap();
         assert_eq!(

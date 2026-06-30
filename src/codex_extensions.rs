@@ -8,13 +8,14 @@ use codex_protocol::user_input::UserInput;
 use serde_json::{json, value::RawValue};
 use tracing::error;
 
-pub(crate) const CONTEXT_COMPACTED_METHOD: &str = "_jaz/context_compacted";
-pub(crate) const GOAL_UPDATE_METHOD: &str = "_jaz/session_goal_update";
+pub(crate) const CONTEXT_COMPACTED_METHOD: &str = "codex/context_compacted";
+pub(crate) const GOAL_UPDATE_METHOD: &str = "thread/goal/updated";
 
-const JAZ_META_KEY: &str = "jaz";
-const GOAL_REQUESTED_META_KEY: &str = "goalRequested";
-const GOAL_OBJECTIVE_META_KEY: &str = "goalObjective";
-const GOAL_REQUEST_CONTEXT_KEY: &str = "jaz.goal_request";
+const CODEX_META_KEY: &str = "codex";
+const GOAL_META_KEY: &str = "goal";
+const GOAL_REQUESTED_META_KEY: &str = "requested";
+const GOAL_OBJECTIVE_META_KEY: &str = "objective";
+const GOAL_REQUEST_CONTEXT_KEY: &str = "codex.goal_request";
 const GOAL_REQUEST_CONTEXT: &str = "Use native Codex goal support for this prompt. If no goal is active, create one with the user's request as the objective. Continue according to native Codex goal rules until the goal is complete, blocked, budget-limited, usage-limited, or requires user input.";
 
 pub(crate) struct GoalRequest {
@@ -22,15 +23,17 @@ pub(crate) struct GoalRequest {
 }
 
 pub(crate) fn goal_request(meta: Option<&Meta>) -> Option<GoalRequest> {
-    let jaz = meta
-        .and_then(|meta| meta.get(JAZ_META_KEY))
+    let goal = meta
+        .and_then(|meta| meta.get(CODEX_META_KEY))
         .and_then(serde_json::Value::as_object)
-        .filter(|jaz| {
-            jaz.get(GOAL_REQUESTED_META_KEY)
+        .and_then(|codex| codex.get(GOAL_META_KEY))
+        .and_then(serde_json::Value::as_object)
+        .filter(|goal| {
+            goal.get(GOAL_REQUESTED_META_KEY)
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false)
         })?;
-    let objective = jaz
+    let objective = goal
         .get(GOAL_OBJECTIVE_META_KEY)
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
@@ -134,4 +137,38 @@ fn thread_goal_update_payload(event: &ThreadGoalUpdatedEvent) -> serde_json::Val
         "createdAt": goal.created_at,
         "updatedAt": goal.updated_at,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_codex_goal_request_meta() {
+        let meta = Meta::from_iter([(
+            "codex".to_string(),
+            serde_json::json!({
+                "goal": {
+                    "requested": true,
+                    "objective": "  Finish the goal  "
+                }
+            }),
+        )]);
+
+        let request = goal_request(Some(&meta)).expect("goal request");
+        assert_eq!(request.objective.as_deref(), Some("Finish the goal"));
+    }
+
+    #[test]
+    fn ignores_jaz_goal_request_meta() {
+        let meta = Meta::from_iter([(
+            "jaz".to_string(),
+            serde_json::json!({
+                "goalRequested": true,
+                "goalObjective": "Finish the goal"
+            }),
+        )]);
+
+        assert!(goal_request(Some(&meta)).is_none());
+    }
 }
