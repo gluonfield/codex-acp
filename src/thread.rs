@@ -31,10 +31,6 @@ use codex_core::{
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
 };
-use codex_features::Feature;
-use codex_goal_extension::{
-    GoalObjectiveUpdate, GoalService, GoalSetRequest, GoalTokenBudgetUpdate,
-};
 use codex_login::auth::AuthManager;
 use codex_models_manager::{
     collaboration_mode_presets::builtin_collaboration_mode_presets,
@@ -95,7 +91,11 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::{codex_extensions, developer_instructions::append_developer_instructions};
+use crate::{
+    codex_extensions,
+    developer_instructions::append_developer_instructions,
+    native_goal::{NativeGoal, NativeGoalThread},
+};
 
 /// Abstraction over the ACP connection for sending notifications and requests
 /// back to the client. This replaces the old `Client` trait usage.
@@ -249,16 +249,10 @@ fn mode_trusts_project(mode_id: &str) -> bool {
 }
 
 /// Trait for abstracting over the `CodexThread` to make testing easier.
-pub trait CodexThreadImpl: Send + Sync {
+pub trait CodexThreadImpl: NativeGoalThread + Send + Sync {
     fn submit(&self, op: Op)
     -> Pin<Box<dyn Future<Output = Result<String, CodexErr>> + Send + '_>>;
     fn next_event(&self) -> Pin<Box<dyn Future<Output = Result<Event, CodexErr>> + Send + '_>>;
-    fn ensure_goal_requested(
-        &self,
-        goal_service: Arc<GoalService>,
-        thread_id: ThreadId,
-        objective: Option<String>,
-    ) -> Pin<Box<dyn Future<Output = Result<ThreadGoalUpdatedEvent, CodexErr>> + Send + '_>>;
 }
 
 impl CodexThreadImpl for CodexThread {
@@ -271,70 +265,6 @@ impl CodexThreadImpl for CodexThread {
 
     fn next_event(&self) -> Pin<Box<dyn Future<Output = Result<Event, CodexErr>> + Send + '_>> {
         Box::pin(self.next_event())
-    }
-
-    fn ensure_goal_requested(
-        &self,
-        goal_service: Arc<GoalService>,
-        thread_id: ThreadId,
-        objective: Option<String>,
-    ) -> Pin<Box<dyn Future<Output = Result<ThreadGoalUpdatedEvent, CodexErr>> + Send + '_>> {
-        Box::pin(async move {
-            if !self.enabled(Feature::Goals) {
-                return Err(CodexErr::InvalidRequest(
-                    "goals feature is disabled".to_string(),
-                ));
-            }
-            let state_db = self.state_db().ok_or_else(|| {
-                CodexErr::InvalidRequest("sqlite state db unavailable for thread goals".to_string())
-            })?;
-            if let Some(goal) = goal_service
-                .get_thread_goal(state_db.as_ref(), thread_id)
-                .await
-                .map_err(goal_service_error)?
-                .filter(|goal| goal.status == ThreadGoalStatus::Active)
-            {
-                return Ok(ThreadGoalUpdatedEvent {
-                    thread_id,
-                    turn_id: None,
-                    goal,
-                });
-            }
-            let objective = objective.ok_or_else(|| {
-                CodexErr::InvalidRequest("goal objective missing for requested goal".to_string())
-            })?;
-            goal_service
-                .clear_thread_goal(state_db.as_ref(), thread_id)
-                .await
-                .map_err(goal_service_error)?;
-            let outcome = goal_service
-                .set_thread_goal(
-                    state_db.as_ref(),
-                    GoalSetRequest {
-                        thread_id,
-                        objective: GoalObjectiveUpdate::Set(objective.as_str()),
-                        status: Some(ThreadGoalStatus::Active),
-                        token_budget: GoalTokenBudgetUpdate::Set(None),
-                    },
-                )
-                .await
-                .map_err(goal_service_error)?;
-            outcome.apply_runtime_effects(&goal_service).await;
-            Ok(ThreadGoalUpdatedEvent {
-                thread_id,
-                turn_id: None,
-                goal: outcome.goal,
-            })
-        })
-    }
-}
-
-fn goal_service_error(err: codex_goal_extension::GoalServiceError) -> CodexErr {
-    match err {
-        codex_goal_extension::GoalServiceError::InvalidRequest(message) => {
-            CodexErr::InvalidRequest(message)
-        }
-        codex_goal_extension::GoalServiceError::Internal(message) => CodexErr::Fatal(message),
     }
 }
 
@@ -510,12 +440,11 @@ impl Thread {
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         session_id: SessionId,
-        thread_id: ThreadId,
         thread: Arc<dyn CodexThreadImpl>,
         thread_forker: Option<Arc<dyn ThreadForker>>,
         source_rollout_path: Option<PathBuf>,
         auth: Arc<AuthManager>,
-        goal_service: Arc<GoalService>,
+        native_goal: NativeGoal,
         models_manager: Arc<dyn ModelsManagerImpl>,
         client_capabilities: Arc<Mutex<ClientCapabilities>>,
         config: Config,
@@ -527,12 +456,11 @@ impl Thread {
         let actor = ThreadActor::new(
             auth,
             SessionClient::new(session_id, cx, client_capabilities),
-            thread_id,
             thread.clone(),
             thread_forker,
             source_rollout_path,
             models_manager,
-            goal_service,
+            native_goal,
             config,
             message_rx,
             resolution_tx,
@@ -3177,6 +3105,12 @@ impl SessionClient {
         ));
     }
 
+    fn send_thread_goal_clear(&self) {
+        self.send_ext_notification(codex_extensions::thread_goal_clear_notification(
+            &self.session_id,
+        ));
+    }
+
     fn send_user_message(&self, text: impl Into<String>) {
         self.send_notification(SessionUpdate::UserMessageChunk(ContentChunk::new(
             text.into().into(),
@@ -3289,12 +3223,11 @@ struct ThreadActor<A> {
     auth: A,
     /// Used for sending messages back to the client.
     client: SessionClient,
-    thread_id: ThreadId,
     /// The thread associated with this task.
     thread: Arc<dyn CodexThreadImpl>,
     thread_forker: Option<Arc<dyn ThreadForker>>,
     source_rollout_path: Option<PathBuf>,
-    goal_service: Arc<GoalService>,
+    native_goal: NativeGoal,
     /// The configuration for the thread.
     config: Config,
     /// The models available for this thread.
@@ -3320,12 +3253,11 @@ impl<A: Auth> ThreadActor<A> {
     fn new(
         auth: A,
         client: SessionClient,
-        thread_id: ThreadId,
         thread: Arc<dyn CodexThreadImpl>,
         thread_forker: Option<Arc<dyn ThreadForker>>,
         source_rollout_path: Option<PathBuf>,
         models_manager: Arc<dyn ModelsManagerImpl>,
-        goal_service: Arc<GoalService>,
+        native_goal: NativeGoal,
         config: Config,
         message_rx: mpsc::UnboundedReceiver<ThreadMessage>,
         resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
@@ -3334,11 +3266,10 @@ impl<A: Auth> ThreadActor<A> {
         Self {
             auth,
             client,
-            thread_id,
             thread,
             thread_forker,
             source_rollout_path,
-            goal_service,
+            native_goal,
             config,
             models_manager,
             resolution_tx,
@@ -3951,10 +3882,9 @@ impl<A: Auth> ThreadActor<A> {
 
         let seeded_active_goal = if submit_goal_request {
             let event = self
-                .thread
-                .ensure_goal_requested(
-                    Arc::clone(&self.goal_service),
-                    self.thread_id,
+                .native_goal
+                .ensure_requested(
+                    self.thread.as_ref(),
                     goal_request
                         .as_ref()
                         .and_then(|request| request.objective.clone()),
@@ -4159,11 +4089,16 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn handle_cancel(&mut self) -> Result<(), Error> {
+        let clear_goal = self.native_goal.clear(self.thread.as_ref()).await;
+        if matches!(clear_goal, Ok(true)) {
+            self.client.send_thread_goal_clear();
+        }
         self.detach_pending_interactions();
         self.thread
             .submit(Op::Interrupt)
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+        clear_goal.map_err(|e| Error::internal_error().data(e.to_string()))?;
         Ok(())
     }
 
@@ -5053,11 +4988,12 @@ mod tests {
     use std::path::Path;
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use agent_client_protocol::schema::{RequestPermissionResponse, TextContent};
     use codex_core::{config::ConfigOverrides, test_support::all_model_presets};
+    use codex_goal_extension::GoalService;
     use codex_protocol::config_types::ModeKind;
     use codex_protocol::{ThreadId, protocol::ThreadGoal};
     use tokio::sync::{Mutex, Notify, mpsc::UnboundedSender};
@@ -5269,6 +5205,73 @@ mod tests {
         })?;
         drop(message_tx);
         tokio::time::timeout(Duration::from_secs(2), handle).await??;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancel_clears_native_goal_state() -> anyhow::Result<()> {
+        let (session_id, client, thread, message_tx, _handle) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["hold-open".into()]).meta(
+                Meta::from_iter([(
+                    "codex".to_string(),
+                    serde_json::json!({
+                        "goal": {
+                            "requested": true,
+                            "objective": "keep going until complete"
+                        },
+                    }),
+                )]),
+            ),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let _stop_reason_rx =
+            tokio::time::timeout(Duration::from_secs(2), prompt_response_rx).await???;
+        assert_eq!(thread.requested_goals.lock().unwrap().len(), 1);
+
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        message_tx.send(ThreadMessage::Cancel {
+            response_tx: cancel_tx,
+        })?;
+        tokio::time::timeout(Duration::from_secs(2), cancel_rx).await???;
+
+        assert_eq!(thread.cleared_goals.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            thread.goal_action_order.lock().unwrap().as_slice(),
+            ["clear", "interrupt"]
+        );
+        {
+            let ops = thread.ops.lock().unwrap();
+            assert!(matches!(ops.first(), Some(Op::UserInput { .. })));
+            assert!(
+                matches!(ops.get(1), Some(Op::Interrupt)),
+                "expected interrupt after prompt op, got {ops:?}"
+            );
+        }
+
+        let clear_notifications = client
+            .agent_notifications
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|notification| match notification {
+                AgentNotification::ExtNotification(update)
+                    if update.method.as_ref() == codex_extensions::GOAL_CLEAR_METHOD =>
+                {
+                    Some(serde_json::from_str::<serde_json::Value>(update.params.get()).unwrap())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(clear_notifications.len(), 1);
+        assert_eq!(
+            clear_notifications[0]["sessionId"],
+            serde_json::json!(session_id)
+        );
 
         Ok(())
     }
@@ -6245,12 +6248,11 @@ mod tests {
         let actor = ThreadActor::new(
             StubAuth,
             session_client,
-            ThreadId::default(),
             conversation.clone(),
             thread_forker,
             source_rollout_path,
             models_manager,
-            Arc::new(GoalService::new()),
+            NativeGoal::new(Arc::new(GoalService::new()), ThreadId::default()),
             config,
             message_rx,
             resolution_tx,
@@ -6289,6 +6291,8 @@ mod tests {
         active_prompt_id: std::sync::Mutex<Option<String>>,
         ops: std::sync::Mutex<Vec<Op>>,
         requested_goals: std::sync::Mutex<Vec<String>>,
+        cleared_goals: AtomicUsize,
+        goal_action_order: std::sync::Mutex<Vec<&'static str>>,
         op_tx: mpsc::UnboundedSender<Event>,
         op_rx: Mutex<mpsc::UnboundedReceiver<Event>>,
     }
@@ -6301,6 +6305,8 @@ mod tests {
                 active_prompt_id: std::sync::Mutex::default(),
                 ops: std::sync::Mutex::default(),
                 requested_goals: std::sync::Mutex::default(),
+                cleared_goals: AtomicUsize::new(0),
+                goal_action_order: std::sync::Mutex::default(),
                 op_tx,
                 op_rx: Mutex::new(op_rx),
             }
@@ -6727,8 +6733,10 @@ mod tests {
                     | Op::ResolveElicitation { .. }
                     | Op::RequestPermissionsResponse { .. }
                     | Op::PatchApproval { .. }
-                    | Op::ThreadSettings { .. }
-                    | Op::Interrupt => {}
+                    | Op::ThreadSettings { .. } => {}
+                    Op::Interrupt => {
+                        self.goal_action_order.lock().unwrap().push("interrupt");
+                    }
                     Op::Shutdown => {
                         if let Some(active_prompt_id) = self.active_prompt_id.lock().unwrap().take()
                         {
@@ -6762,8 +6770,10 @@ mod tests {
                 Ok(event)
             })
         }
+    }
 
-        fn ensure_goal_requested(
+    impl NativeGoalThread for StubCodexThread {
+        fn ensure_native_goal_requested(
             &self,
             _goal_service: Arc<GoalService>,
             thread_id: ThreadId,
@@ -6772,7 +6782,6 @@ mod tests {
         {
             Box::pin(async move {
                 let objective = objective.unwrap_or_else(|| "stub goal".to_string());
-                let objective = objective.trim().to_string();
                 self.requested_goals.lock().unwrap().push(objective.clone());
                 Ok(ThreadGoalUpdatedEvent {
                     thread_id,
@@ -6788,6 +6797,18 @@ mod tests {
                         updated_at: 1,
                     },
                 })
+            })
+        }
+
+        fn clear_native_goal(
+            &self,
+            _goal_service: Arc<GoalService>,
+            _thread_id: ThreadId,
+        ) -> Pin<Box<dyn Future<Output = Result<bool, CodexErr>> + Send + '_>> {
+            Box::pin(async move {
+                self.cleared_goals.fetch_add(1, Ordering::SeqCst);
+                self.goal_action_order.lock().unwrap().push("clear");
+                Ok(true)
             })
         }
     }
@@ -7560,12 +7581,11 @@ mod tests {
         let actor = ThreadActor::new(
             StubAuth,
             session_client,
-            ThreadId::default(),
             conversation.clone(),
             None,
             None,
             models_manager,
-            Arc::new(GoalService::new()),
+            NativeGoal::new(Arc::new(GoalService::new()), ThreadId::default()),
             config,
             message_rx,
             resolution_tx,

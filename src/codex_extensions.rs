@@ -10,6 +10,7 @@ use tracing::error;
 
 pub(crate) const CONTEXT_COMPACTED_METHOD: &str = "codex/context_compacted";
 pub(crate) const GOAL_UPDATE_METHOD: &str = "thread/goal/updated";
+pub(crate) const GOAL_CLEAR_METHOD: &str = "thread/goal/cleared";
 
 const CODEX_META_KEY: &str = "codex";
 const GOAL_META_KEY: &str = "goal";
@@ -88,6 +89,15 @@ pub(crate) fn thread_goal_update_notification(
         json!({
             "sessionId": session_id.clone(),
             "goal": thread_goal_update_payload(event),
+        }),
+    )
+}
+
+pub(crate) fn thread_goal_clear_notification(session_id: &SessionId) -> Option<AgentNotification> {
+    ext_notification(
+        GOAL_CLEAR_METHOD,
+        json!({
+            "sessionId": session_id.clone(),
         }),
     )
 }

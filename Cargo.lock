@@ -1779,7 +1779,7 @@ dependencies = [
 
 [[package]]
 name = "codex-acp"
-version = "0.16.11"
+version = "0.16.12"
 dependencies = [
  "agent-client-protocol",
  "allocative",

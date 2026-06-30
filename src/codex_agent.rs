@@ -19,7 +19,7 @@ use codex_core::{
     find_thread_path_by_id_str, init_state_db, resolve_installation_id, thread_store_from_config,
 };
 use codex_exec_server::{EnvironmentManager, ExecServerRuntimePaths};
-use codex_extension_api::{ExtensionEventSink, ExtensionRegistryBuilder};
+use codex_extension_api::ExtensionRegistryBuilder;
 use codex_features::Feature;
 use codex_goal_extension::GoalService;
 use codex_home::CodexHomeUserInstructionsProvider;
@@ -29,7 +29,7 @@ use codex_login::{
 };
 use codex_protocol::{
     ThreadId,
-    protocol::{Event, EventMsg, InitialHistory, SessionSource},
+    protocol::{InitialHistory, SessionSource},
 };
 use codex_thread_store::{
     ListThreadsParams, SortDirection as StoreSortDirection, ThreadSortKey as StoreThreadSortKey,
@@ -44,8 +44,11 @@ use std::{
 use tracing::{debug, info};
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::developer_instructions::apply_session_meta_developer_instructions;
 use crate::thread::{Thread, ThreadForker};
+use crate::{
+    developer_instructions::apply_session_meta_developer_instructions,
+    native_goal::{NativeGoal, NativeGoalEventSink},
+};
 
 /// The Codex implementation of the ACP Agent.
 ///
@@ -75,28 +78,6 @@ pub struct CodexAgent {
 const SESSION_LIST_PAGE_SIZE: usize = 25;
 const SESSION_TITLE_MAX_GRAPHEMES: usize = 120;
 
-struct AcpExtensionEventSink {
-    sessions: Arc<Mutex<HashMap<SessionId, Arc<Thread>>>>,
-}
-
-impl AcpExtensionEventSink {
-    fn new(sessions: Arc<Mutex<HashMap<SessionId, Arc<Thread>>>>) -> Self {
-        Self { sessions }
-    }
-}
-
-impl ExtensionEventSink for AcpExtensionEventSink {
-    fn emit(&self, event: Event) {
-        let session_id = match &event.msg {
-            EventMsg::ThreadGoalUpdated(event) => SessionId::new(event.thread_id.to_string()),
-            _ => return,
-        };
-        if let Some(thread) = self.sessions.lock().unwrap().get(&session_id).cloned() {
-            thread.emit_extension_event(event);
-        }
-    }
-}
-
 impl CodexAgent {
     /// Create a new `CodexAgent` with the given configuration
     pub async fn new(
@@ -124,7 +105,7 @@ impl CodexAgent {
         let goal_service = Arc::new(GoalService::new());
         let thread_manager = Arc::new_cyclic(|thread_manager| {
             let mut extension_builder = ExtensionRegistryBuilder::<Config>::with_event_sink(
-                Arc::new(AcpExtensionEventSink::new(Arc::clone(&sessions))),
+                Arc::new(NativeGoalEventSink::new(Arc::clone(&sessions))),
             );
             if let Some(state_db) = state_db.clone() {
                 codex_goal_extension::install_with_backend(
@@ -647,12 +628,11 @@ impl CodexAgent {
         let thread_forker: Arc<dyn ThreadForker> = self.thread_manager.clone();
         let thread = Arc::new(Thread::new(
             session_id.clone(),
-            thread_id,
             thread,
             Some(thread_forker),
             session_configured.rollout_path,
             self.auth_manager.clone(),
-            Arc::clone(&self.goal_service),
+            NativeGoal::new(Arc::clone(&self.goal_service), thread_id),
             Arc::new(self.thread_manager.get_models_manager()),
             self.client_capabilities.clone(),
             config.clone(),
@@ -771,12 +751,11 @@ impl CodexAgent {
         let thread_forker: Arc<dyn ThreadForker> = self.thread_manager.clone();
         let thread = Arc::new(Thread::new(
             session_id.clone(),
-            thread_id,
             thread,
             Some(thread_forker),
             session_configured.rollout_path.or(Some(rollout_path)),
             self.auth_manager.clone(),
-            Arc::clone(&self.goal_service),
+            NativeGoal::new(Arc::clone(&self.goal_service), thread_id),
             Arc::new(self.thread_manager.get_models_manager()),
             self.client_capabilities.clone(),
             config.clone(),
