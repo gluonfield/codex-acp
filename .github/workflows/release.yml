@@ -51,12 +51,10 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
-          # Windows release binaries are temporarily disabled because they make
-          # the release workflow substantially slower and are not used by Jaz.
-          # - os: windows-latest
-          #   target: x86_64-pc-windows-msvc
-          # - os: windows-latest
-          #   target: aarch64-pc-windows-msvc
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
 
     runs-on: ${{ matrix.os }}
 
