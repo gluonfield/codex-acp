@@ -9,13 +9,11 @@ use agent_client_protocol::schema::SessionId;
 use codex_core::CodexThread;
 use codex_extension_api::ExtensionEventSink;
 use codex_features::Feature;
-use codex_goal_extension::{
-    GoalObjectiveUpdate, GoalService, GoalSetRequest, GoalTokenBudgetUpdate,
-};
+use codex_goal_extension::GoalService;
 use codex_protocol::{
     ThreadId,
     error::CodexErr,
-    protocol::{Event, EventMsg, ThreadGoalStatus, ThreadGoalUpdatedEvent},
+    protocol::{Event, EventMsg},
 };
 
 use crate::thread::Thread;
@@ -31,16 +29,6 @@ impl NativeGoal {
         Self { service, thread_id }
     }
 
-    pub(crate) async fn ensure_requested(
-        &self,
-        thread: &(impl NativeGoalThread + ?Sized),
-        objective: Option<String>,
-    ) -> Result<ThreadGoalUpdatedEvent, CodexErr> {
-        thread
-            .ensure_native_goal_requested(Arc::clone(&self.service), self.thread_id, objective)
-            .await
-    }
-
     pub(crate) async fn clear(
         &self,
         thread: &(impl NativeGoalThread + ?Sized),
@@ -52,13 +40,6 @@ impl NativeGoal {
 }
 
 pub(crate) trait NativeGoalThread: Send + Sync {
-    fn ensure_native_goal_requested(
-        &self,
-        goal_service: Arc<GoalService>,
-        thread_id: ThreadId,
-        objective: Option<String>,
-    ) -> Pin<Box<dyn Future<Output = Result<ThreadGoalUpdatedEvent, CodexErr>> + Send + '_>>;
-
     fn clear_native_goal(
         &self,
         goal_service: Arc<GoalService>,
@@ -67,61 +48,6 @@ pub(crate) trait NativeGoalThread: Send + Sync {
 }
 
 impl NativeGoalThread for CodexThread {
-    fn ensure_native_goal_requested(
-        &self,
-        goal_service: Arc<GoalService>,
-        thread_id: ThreadId,
-        objective: Option<String>,
-    ) -> Pin<Box<dyn Future<Output = Result<ThreadGoalUpdatedEvent, CodexErr>> + Send + '_>> {
-        Box::pin(async move {
-            if !self.enabled(Feature::Goals) {
-                return Err(CodexErr::InvalidRequest(
-                    "goals feature is disabled".to_string(),
-                ));
-            }
-            let state_db = self.state_db().ok_or_else(|| {
-                CodexErr::InvalidRequest("sqlite state db unavailable for thread goals".to_string())
-            })?;
-            if let Some(goal) = goal_service
-                .get_thread_goal(state_db.as_ref(), thread_id)
-                .await
-                .map_err(goal_service_error)?
-                .filter(|goal| goal.status == ThreadGoalStatus::Active)
-            {
-                return Ok(ThreadGoalUpdatedEvent {
-                    thread_id,
-                    turn_id: None,
-                    goal,
-                });
-            }
-            let objective = objective.ok_or_else(|| {
-                CodexErr::InvalidRequest("goal objective missing for requested goal".to_string())
-            })?;
-            goal_service
-                .clear_thread_goal(state_db.as_ref(), thread_id)
-                .await
-                .map_err(goal_service_error)?;
-            let outcome = goal_service
-                .set_thread_goal(
-                    state_db.as_ref(),
-                    GoalSetRequest {
-                        thread_id,
-                        objective: GoalObjectiveUpdate::Set(objective.as_str()),
-                        status: Some(ThreadGoalStatus::Active),
-                        token_budget: GoalTokenBudgetUpdate::Set(None),
-                    },
-                )
-                .await
-                .map_err(goal_service_error)?;
-            outcome.apply_runtime_effects(&goal_service).await;
-            Ok(ThreadGoalUpdatedEvent {
-                thread_id,
-                turn_id: None,
-                goal: outcome.goal,
-            })
-        })
-    }
-
     fn clear_native_goal(
         &self,
         goal_service: Arc<GoalService>,

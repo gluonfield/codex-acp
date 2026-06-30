@@ -15,32 +15,17 @@ pub(crate) const GOAL_CLEAR_METHOD: &str = "thread/goal/cleared";
 const CODEX_META_KEY: &str = "codex";
 const GOAL_META_KEY: &str = "goal";
 const GOAL_REQUESTED_META_KEY: &str = "requested";
-const GOAL_OBJECTIVE_META_KEY: &str = "objective";
 const GOAL_REQUEST_CONTEXT_KEY: &str = "codex.goal_request";
-const GOAL_REQUEST_CONTEXT: &str = "Use native Codex goal support for this prompt. If no goal is active, create one with the user's request as the objective. Continue according to native Codex goal rules until the goal is complete, blocked, budget-limited, usage-limited, or requires user input.";
+const GOAL_REQUEST_CONTEXT: &str = "Goal mode was explicitly requested for this prompt. If no goal is active, call create_goal with a concise objective derived from the user's request before continuing. Continue according to native Codex goal rules until the goal is complete, blocked, budget-limited, usage-limited, or requires user input.";
 
-pub(crate) struct GoalRequest {
-    pub objective: Option<String>,
-}
-
-pub(crate) fn goal_request(meta: Option<&Meta>) -> Option<GoalRequest> {
-    let goal = meta
-        .and_then(|meta| meta.get(CODEX_META_KEY))
+pub(crate) fn goal_requested(meta: Option<&Meta>) -> bool {
+    meta.and_then(|meta| meta.get(CODEX_META_KEY))
         .and_then(serde_json::Value::as_object)
         .and_then(|codex| codex.get(GOAL_META_KEY))
         .and_then(serde_json::Value::as_object)
-        .filter(|goal| {
-            goal.get(GOAL_REQUESTED_META_KEY)
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
-        })?;
-    let objective = goal
-        .get(GOAL_OBJECTIVE_META_KEY)
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|objective| !objective.is_empty())
-        .map(str::to_owned);
-    Some(GoalRequest { objective })
+        .and_then(|goal| goal.get(GOAL_REQUESTED_META_KEY))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 pub(crate) fn goal_request_context() -> (String, AdditionalContextEntry) {
@@ -165,8 +150,7 @@ mod tests {
             }),
         )]);
 
-        let request = goal_request(Some(&meta)).expect("goal request");
-        assert_eq!(request.objective.as_deref(), Some("Finish the goal"));
+        assert!(goal_requested(Some(&meta)));
     }
 
     #[test]
@@ -179,6 +163,6 @@ mod tests {
             }),
         )]);
 
-        assert!(goal_request(Some(&meta)).is_none());
+        assert!(!goal_requested(Some(&meta)));
     }
 }

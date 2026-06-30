@@ -3792,7 +3792,7 @@ impl<A: Auth> ThreadActor<A> {
         let (response_tx, response_rx) = oneshot::channel();
 
         let side_scope = side_prompt_scope(request.meta.as_ref());
-        let goal_request = codex_extensions::goal_request(request.meta.as_ref());
+        let goal_requested = codex_extensions::goal_requested(request.meta.as_ref());
         let items = build_prompt_items(request.prompt);
         if let Some(scope) = side_scope {
             return self
@@ -3800,7 +3800,6 @@ impl<A: Auth> ThreadActor<A> {
                 .await;
         }
         let op;
-        let mut submit_goal_request = false;
         if let Some((name, rest)) = extract_slash_command(&items) {
             match name {
                 SIDE_COMMAND | BTW_COMMAND => {
@@ -3871,31 +3870,12 @@ impl<A: Auth> ThreadActor<A> {
                     return Err(Error::auth_required());
                 }
                 _ => {
-                    submit_goal_request = goal_request.is_some();
-                    op = codex_extensions::user_input_op(items, submit_goal_request);
+                    op = codex_extensions::user_input_op(items, goal_requested);
                 }
             }
         } else {
-            submit_goal_request = goal_request.is_some();
-            op = codex_extensions::user_input_op(items, submit_goal_request);
+            op = codex_extensions::user_input_op(items, goal_requested);
         }
-
-        let seeded_active_goal = if submit_goal_request {
-            let event = self
-                .native_goal
-                .ensure_requested(
-                    self.thread.as_ref(),
-                    goal_request
-                        .as_ref()
-                        .and_then(|request| request.objective.clone()),
-                )
-                .await
-                .map_err(|e| Error::internal_error().data(e.to_string()))?;
-            self.client.send_thread_goal_update(&event);
-            matches!(event.goal.status, ThreadGoalStatus::Active)
-        } else {
-            false
-        };
 
         let submission_id = self
             .thread
@@ -3906,13 +3886,12 @@ impl<A: Auth> ThreadActor<A> {
         info!("Submitted prompt with submission_id: {submission_id}");
         info!("Starting to wait for conversation events for submission_id: {submission_id}");
 
-        let mut prompt_state = PromptState::new(
+        let prompt_state = PromptState::new(
             submission_id.clone(),
             self.thread.clone(),
             self.resolution_tx.clone(),
             response_tx,
         );
-        prompt_state.active_goal_continuation = seeded_active_goal;
         let state = SubmissionState::Prompt(prompt_state);
 
         self.submissions.insert(submission_id, state);
@@ -5076,34 +5055,20 @@ mod tests {
                 entry.kind,
                 codex_protocol::protocol::AdditionalContextKind::Application
             ));
-            assert!(entry.value.contains("native Codex goal support"));
+            assert!(entry.value.contains("Goal mode was explicitly requested"));
         }
-        {
-            let goals = thread.requested_goals.lock().unwrap();
-            assert_eq!(goals.as_slice(), ["Ship native goal mode"]);
-        }
-        {
-            let agent_notifications = client.agent_notifications.lock().unwrap();
-            let update = agent_notifications
+        assert!(
+            client
+                .agent_notifications
+                .lock()
+                .unwrap()
                 .iter()
-                .find_map(|notification| match notification {
+                .all(|notification| !matches!(
+                    notification,
                     AgentNotification::ExtNotification(update)
-                        if update.method.as_ref() == codex_extensions::GOAL_UPDATE_METHOD =>
-                    {
-                        Some(
-                            serde_json::from_str::<serde_json::Value>(update.params.get())
-                                .expect("goal update JSON"),
-                        )
-                    }
-                    _ => None,
-                })
-                .expect("seeded goal update notification");
-            assert_eq!(
-                update["goal"]["objective"],
-                serde_json::json!("Ship native goal mode")
-            );
-            assert_eq!(update["goal"]["status"], serde_json::json!("active"));
-        }
+                        if update.method.as_ref() == codex_extensions::GOAL_UPDATE_METHOD
+                ))
+        );
 
         thread.op_tx.send(Event {
             id: "0".to_string(),
@@ -5231,7 +5196,6 @@ mod tests {
 
         let _stop_reason_rx =
             tokio::time::timeout(Duration::from_secs(2), prompt_response_rx).await???;
-        assert_eq!(thread.requested_goals.lock().unwrap().len(), 1);
 
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
         message_tx.send(ThreadMessage::Cancel {
@@ -6290,7 +6254,6 @@ mod tests {
         current_id: AtomicUsize,
         active_prompt_id: std::sync::Mutex<Option<String>>,
         ops: std::sync::Mutex<Vec<Op>>,
-        requested_goals: std::sync::Mutex<Vec<String>>,
         cleared_goals: AtomicUsize,
         goal_action_order: std::sync::Mutex<Vec<&'static str>>,
         op_tx: mpsc::UnboundedSender<Event>,
@@ -6304,7 +6267,6 @@ mod tests {
                 current_id: AtomicUsize::new(0),
                 active_prompt_id: std::sync::Mutex::default(),
                 ops: std::sync::Mutex::default(),
-                requested_goals: std::sync::Mutex::default(),
                 cleared_goals: AtomicUsize::new(0),
                 goal_action_order: std::sync::Mutex::default(),
                 op_tx,
@@ -6773,33 +6735,6 @@ mod tests {
     }
 
     impl NativeGoalThread for StubCodexThread {
-        fn ensure_native_goal_requested(
-            &self,
-            _goal_service: Arc<GoalService>,
-            thread_id: ThreadId,
-            objective: Option<String>,
-        ) -> Pin<Box<dyn Future<Output = Result<ThreadGoalUpdatedEvent, CodexErr>> + Send + '_>>
-        {
-            Box::pin(async move {
-                let objective = objective.unwrap_or_else(|| "stub goal".to_string());
-                self.requested_goals.lock().unwrap().push(objective.clone());
-                Ok(ThreadGoalUpdatedEvent {
-                    thread_id,
-                    turn_id: None,
-                    goal: ThreadGoal {
-                        thread_id,
-                        objective,
-                        status: ThreadGoalStatus::Active,
-                        token_budget: None,
-                        tokens_used: 0,
-                        time_used_seconds: 0,
-                        created_at: 1,
-                        updated_at: 1,
-                    },
-                })
-            })
-        }
-
         fn clear_native_goal(
             &self,
             _goal_service: Arc<GoalService>,
