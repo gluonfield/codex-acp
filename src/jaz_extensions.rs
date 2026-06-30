@@ -13,15 +13,30 @@ pub(crate) const GOAL_UPDATE_METHOD: &str = "_jaz/session_goal_update";
 
 const JAZ_META_KEY: &str = "jaz";
 const GOAL_REQUESTED_META_KEY: &str = "goalRequested";
+const GOAL_OBJECTIVE_META_KEY: &str = "goalObjective";
 const GOAL_REQUEST_CONTEXT_KEY: &str = "jaz.goal_request";
 const GOAL_REQUEST_CONTEXT: &str = "Use native Codex goal support for this prompt. If no goal is active, create one with the user's request as the objective. Continue according to native Codex goal rules until the goal is complete, blocked, budget-limited, usage-limited, or requires user input.";
 
-pub(crate) fn goal_requested(meta: Option<&Meta>) -> bool {
-    meta.and_then(|meta| meta.get(JAZ_META_KEY))
+pub(crate) struct GoalRequest {
+    pub objective: Option<String>,
+}
+
+pub(crate) fn goal_request(meta: Option<&Meta>) -> Option<GoalRequest> {
+    let jaz = meta
+        .and_then(|meta| meta.get(JAZ_META_KEY))
         .and_then(serde_json::Value::as_object)
-        .and_then(|jaz| jaz.get(GOAL_REQUESTED_META_KEY))
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
+        .filter(|jaz| {
+            jaz.get(GOAL_REQUESTED_META_KEY)
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        })?;
+    let objective = jaz
+        .get(GOAL_OBJECTIVE_META_KEY)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|objective| !objective.is_empty())
+        .map(str::to_owned);
+    Some(GoalRequest { objective })
 }
 
 pub(crate) fn goal_request_context() -> (String, AdditionalContextEntry) {

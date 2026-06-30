@@ -31,6 +31,10 @@ use codex_core::{
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
 };
+use codex_features::Feature;
+use codex_goal_extension::{
+    GoalObjectiveUpdate, GoalService, GoalSetRequest, GoalTokenBudgetUpdate,
+};
 use codex_login::auth::AuthManager;
 use codex_models_manager::{
     collaboration_mode_presets::builtin_collaboration_mode_presets,
@@ -249,6 +253,12 @@ pub trait CodexThreadImpl: Send + Sync {
     fn submit(&self, op: Op)
     -> Pin<Box<dyn Future<Output = Result<String, CodexErr>> + Send + '_>>;
     fn next_event(&self) -> Pin<Box<dyn Future<Output = Result<Event, CodexErr>> + Send + '_>>;
+    fn ensure_goal_requested(
+        &self,
+        goal_service: Arc<GoalService>,
+        thread_id: ThreadId,
+        objective: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<ThreadGoalUpdatedEvent, CodexErr>> + Send + '_>>;
 }
 
 impl CodexThreadImpl for CodexThread {
@@ -261,6 +271,70 @@ impl CodexThreadImpl for CodexThread {
 
     fn next_event(&self) -> Pin<Box<dyn Future<Output = Result<Event, CodexErr>> + Send + '_>> {
         Box::pin(self.next_event())
+    }
+
+    fn ensure_goal_requested(
+        &self,
+        goal_service: Arc<GoalService>,
+        thread_id: ThreadId,
+        objective: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<ThreadGoalUpdatedEvent, CodexErr>> + Send + '_>> {
+        Box::pin(async move {
+            if !self.enabled(Feature::Goals) {
+                return Err(CodexErr::InvalidRequest(
+                    "goals feature is disabled".to_string(),
+                ));
+            }
+            let state_db = self.state_db().ok_or_else(|| {
+                CodexErr::InvalidRequest("sqlite state db unavailable for thread goals".to_string())
+            })?;
+            if let Some(goal) = goal_service
+                .get_thread_goal(state_db.as_ref(), thread_id)
+                .await
+                .map_err(goal_service_error)?
+                .filter(|goal| goal.status == ThreadGoalStatus::Active)
+            {
+                return Ok(ThreadGoalUpdatedEvent {
+                    thread_id,
+                    turn_id: None,
+                    goal,
+                });
+            }
+            let objective = objective.ok_or_else(|| {
+                CodexErr::InvalidRequest("goal objective missing for requested goal".to_string())
+            })?;
+            goal_service
+                .clear_thread_goal(state_db.as_ref(), thread_id)
+                .await
+                .map_err(goal_service_error)?;
+            let outcome = goal_service
+                .set_thread_goal(
+                    state_db.as_ref(),
+                    GoalSetRequest {
+                        thread_id,
+                        objective: GoalObjectiveUpdate::Set(objective.as_str()),
+                        status: Some(ThreadGoalStatus::Active),
+                        token_budget: GoalTokenBudgetUpdate::Set(None),
+                    },
+                )
+                .await
+                .map_err(goal_service_error)?;
+            outcome.apply_runtime_effects(&goal_service).await;
+            Ok(ThreadGoalUpdatedEvent {
+                thread_id,
+                turn_id: None,
+                goal: outcome.goal,
+            })
+        })
+    }
+}
+
+fn goal_service_error(err: codex_goal_extension::GoalServiceError) -> CodexErr {
+    match err {
+        codex_goal_extension::GoalServiceError::InvalidRequest(message) => {
+            CodexErr::InvalidRequest(message)
+        }
+        codex_goal_extension::GoalServiceError::Internal(message) => CodexErr::Fatal(message),
     }
 }
 
@@ -408,6 +482,9 @@ enum ThreadMessage {
         history: Vec<RolloutItem>,
         response_tx: oneshot::Sender<Result<(), Error>>,
     },
+    ExtensionEvent {
+        event: Box<Event>,
+    },
     PermissionRequestResolved {
         submission_id: String,
         interaction_id: u64,
@@ -433,10 +510,12 @@ impl Thread {
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         session_id: SessionId,
+        thread_id: ThreadId,
         thread: Arc<dyn CodexThreadImpl>,
         thread_forker: Option<Arc<dyn ThreadForker>>,
         source_rollout_path: Option<PathBuf>,
         auth: Arc<AuthManager>,
+        goal_service: Arc<GoalService>,
         models_manager: Arc<dyn ModelsManagerImpl>,
         client_capabilities: Arc<Mutex<ClientCapabilities>>,
         config: Config,
@@ -448,10 +527,12 @@ impl Thread {
         let actor = ThreadActor::new(
             auth,
             SessionClient::new(session_id, cx, client_capabilities),
+            thread_id,
             thread.clone(),
             thread_forker,
             source_rollout_path,
             models_manager,
+            goal_service,
             config,
             message_rx,
             resolution_tx,
@@ -557,6 +638,12 @@ impl Thread {
         response_rx
             .await
             .map_err(|e| Error::internal_error().data(e.to_string()))?
+    }
+
+    pub(crate) fn emit_extension_event(&self, event: Event) {
+        drop(self.message_tx.send(ThreadMessage::ExtensionEvent {
+            event: Box::new(event),
+        }));
     }
 
     pub async fn shutdown(&self) -> Result<(), Error> {
@@ -3202,10 +3289,12 @@ struct ThreadActor<A> {
     auth: A,
     /// Used for sending messages back to the client.
     client: SessionClient,
+    thread_id: ThreadId,
     /// The thread associated with this task.
     thread: Arc<dyn CodexThreadImpl>,
     thread_forker: Option<Arc<dyn ThreadForker>>,
     source_rollout_path: Option<PathBuf>,
+    goal_service: Arc<GoalService>,
     /// The configuration for the thread.
     config: Config,
     /// The models available for this thread.
@@ -3231,10 +3320,12 @@ impl<A: Auth> ThreadActor<A> {
     fn new(
         auth: A,
         client: SessionClient,
+        thread_id: ThreadId,
         thread: Arc<dyn CodexThreadImpl>,
         thread_forker: Option<Arc<dyn ThreadForker>>,
         source_rollout_path: Option<PathBuf>,
         models_manager: Arc<dyn ModelsManagerImpl>,
+        goal_service: Arc<GoalService>,
         config: Config,
         message_rx: mpsc::UnboundedReceiver<ThreadMessage>,
         resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
@@ -3243,9 +3334,11 @@ impl<A: Auth> ThreadActor<A> {
         Self {
             auth,
             client,
+            thread_id,
             thread,
             thread_forker,
             source_rollout_path,
+            goal_service,
             config,
             models_manager,
             resolution_tx,
@@ -3344,6 +3437,9 @@ impl<A: Auth> ThreadActor<A> {
             } => {
                 let result = self.handle_replay_history(history);
                 drop(response_tx.send(result));
+            }
+            ThreadMessage::ExtensionEvent { event } => {
+                self.handle_event(*event).await;
             }
             ThreadMessage::PermissionRequestResolved {
                 submission_id,
@@ -3765,7 +3861,7 @@ impl<A: Auth> ThreadActor<A> {
         let (response_tx, response_rx) = oneshot::channel();
 
         let side_scope = side_prompt_scope(request.meta.as_ref());
-        let goal_requested = jaz_extensions::goal_requested(request.meta.as_ref());
+        let goal_request = jaz_extensions::goal_request(request.meta.as_ref());
         let items = build_prompt_items(request.prompt);
         if let Some(scope) = side_scope {
             return self
@@ -3773,6 +3869,7 @@ impl<A: Auth> ThreadActor<A> {
                 .await;
         }
         let op;
+        let mut submit_goal_request = false;
         if let Some((name, rest)) = extract_slash_command(&items) {
             match name {
                 SIDE_COMMAND | BTW_COMMAND => {
@@ -3843,12 +3940,32 @@ impl<A: Auth> ThreadActor<A> {
                     return Err(Error::auth_required());
                 }
                 _ => {
-                    op = jaz_extensions::user_input_op(items, goal_requested);
+                    submit_goal_request = goal_request.is_some();
+                    op = jaz_extensions::user_input_op(items, submit_goal_request);
                 }
             }
         } else {
-            op = jaz_extensions::user_input_op(items, goal_requested);
+            submit_goal_request = goal_request.is_some();
+            op = jaz_extensions::user_input_op(items, submit_goal_request);
         }
+
+        let seeded_active_goal = if submit_goal_request {
+            let event = self
+                .thread
+                .ensure_goal_requested(
+                    Arc::clone(&self.goal_service),
+                    self.thread_id,
+                    goal_request
+                        .as_ref()
+                        .and_then(|request| request.objective.clone()),
+                )
+                .await
+                .map_err(|e| Error::internal_error().data(e.to_string()))?;
+            self.client.send_thread_goal_update(&event);
+            matches!(event.goal.status, ThreadGoalStatus::Active)
+        } else {
+            false
+        };
 
         let submission_id = self
             .thread
@@ -3859,12 +3976,14 @@ impl<A: Auth> ThreadActor<A> {
         info!("Submitted prompt with submission_id: {submission_id}");
         info!("Starting to wait for conversation events for submission_id: {submission_id}");
 
-        let state = SubmissionState::Prompt(PromptState::new(
+        let mut prompt_state = PromptState::new(
             submission_id.clone(),
             self.thread.clone(),
             self.resolution_tx.clone(),
             response_tx,
-        ));
+        );
+        prompt_state.active_goal_continuation = seeded_active_goal;
+        let state = SubmissionState::Prompt(prompt_state);
 
         self.submissions.insert(submission_id, state);
 
@@ -4931,6 +5050,7 @@ fn extract_slash_command(content: &[UserInput]) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::path::Path;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
@@ -4943,6 +5063,10 @@ mod tests {
     use tokio::sync::{Mutex, Notify, mpsc::UnboundedSender};
 
     use super::*;
+
+    fn path_uri(path: impl AsRef<Path>) -> std::io::Result<codex_utils_path_uri::PathUri> {
+        codex_utils_path_uri::PathUri::from_host_native_path(path)
+    }
 
     #[tokio::test]
     async fn test_prompt() -> anyhow::Result<()> {
@@ -4975,14 +5099,17 @@ mod tests {
 
     #[tokio::test]
     async fn goal_requested_meta_adds_application_context() -> anyhow::Result<()> {
-        let (session_id, _, thread, message_tx, _handle) = setup().await?;
+        let (session_id, client, thread, message_tx, _handle) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ThreadMessage::Prompt {
             request: PromptRequest::new(session_id.clone(), vec!["hold-open".into()]).meta(
                 Meta::from_iter([(
                     "jaz".to_string(),
-                    serde_json::json!({ "goalRequested": true }),
+                    serde_json::json!({
+                        "goalRequested": true,
+                        "goalObjective": "  Ship native goal mode  ",
+                    }),
                 )]),
             ),
             response_tx: prompt_response_tx,
@@ -5013,7 +5140,50 @@ mod tests {
             ));
             assert!(entry.value.contains("native Codex goal support"));
         }
+        {
+            let goals = thread.requested_goals.lock().unwrap();
+            assert_eq!(goals.as_slice(), ["Ship native goal mode"]);
+        }
+        {
+            let agent_notifications = client.agent_notifications.lock().unwrap();
+            let update = agent_notifications
+                .iter()
+                .find_map(|notification| match notification {
+                    AgentNotification::ExtNotification(update)
+                        if update.method.as_ref() == jaz_extensions::GOAL_UPDATE_METHOD =>
+                    {
+                        Some(
+                            serde_json::from_str::<serde_json::Value>(update.params.get())
+                                .expect("goal update JSON"),
+                        )
+                    }
+                    _ => None,
+                })
+                .expect("seeded goal update notification");
+            assert_eq!(
+                update["goal"]["objective"],
+                serde_json::json!("Ship native goal mode")
+            );
+            assert_eq!(update["goal"]["status"], serde_json::json!("active"));
+        }
 
+        thread.op_tx.send(Event {
+            id: "0".to_string(),
+            msg: EventMsg::ThreadGoalUpdated(ThreadGoalUpdatedEvent {
+                thread_id: ThreadId::default(),
+                turn_id: Some("0".to_string()),
+                goal: ThreadGoal {
+                    thread_id: ThreadId::default(),
+                    objective: "Ship native goal mode".to_string(),
+                    status: ThreadGoalStatus::Complete,
+                    token_budget: None,
+                    tokens_used: 0,
+                    time_used_seconds: 0,
+                    created_at: 1,
+                    updated_at: 2,
+                },
+            }),
+        })?;
         thread.op_tx.send(Event {
             id: "0".to_string(),
             msg: EventMsg::TurnComplete(TurnCompleteEvent {
@@ -5554,7 +5724,6 @@ mod tests {
                     text_elements: vec![]
                 }],
                 final_output_json_schema: None,
-                environments: None,
                 responsesapi_client_metadata: None,
                 additional_context: Default::default(),
                 thread_settings: Default::default(),
@@ -6074,10 +6243,12 @@ mod tests {
         let actor = ThreadActor::new(
             StubAuth,
             session_client,
+            ThreadId::default(),
             conversation.clone(),
             thread_forker,
             source_rollout_path,
             models_manager,
+            Arc::new(GoalService::new()),
             config,
             message_rx,
             resolution_tx,
@@ -6115,6 +6286,7 @@ mod tests {
         current_id: AtomicUsize,
         active_prompt_id: std::sync::Mutex<Option<String>>,
         ops: std::sync::Mutex<Vec<Op>>,
+        requested_goals: std::sync::Mutex<Vec<String>>,
         op_tx: mpsc::UnboundedSender<Event>,
         op_rx: Mutex<mpsc::UnboundedReceiver<Event>>,
     }
@@ -6126,6 +6298,7 @@ mod tests {
                 current_id: AtomicUsize::new(0),
                 active_prompt_id: std::sync::Mutex::default(),
                 ops: std::sync::Mutex::default(),
+                requested_goals: std::sync::Mutex::default(),
                 op_tx,
                 op_rx: Mutex::new(op_rx),
             }
@@ -6172,7 +6345,7 @@ mod tests {
                                 process_id: None,
                                 turn_id: turn_id.clone(),
                                 command: vec!["echo".into(), "a".into()],
-                                cwd: cwd.clone().try_into()?,
+                                cwd: path_uri(cwd.clone())?,
                                 parsed_cmd: vec![ParsedCommand::Unknown {
                                     cmd: "echo a".into(),
                                 }],
@@ -6185,7 +6358,7 @@ mod tests {
                                 process_id: None,
                                 turn_id: turn_id.clone(),
                                 command: vec!["echo".into(), "b".into()],
-                                cwd: cwd.clone().try_into()?,
+                                cwd: path_uri(cwd.clone())?,
                                 parsed_cmd: vec![ParsedCommand::Unknown {
                                     cmd: "echo b".into(),
                                 }],
@@ -6198,7 +6371,7 @@ mod tests {
                                 process_id: None,
                                 turn_id: turn_id.clone(),
                                 command: vec!["echo".into(), "a".into()],
-                                cwd: cwd.clone().try_into()?,
+                                cwd: path_uri(cwd.clone())?,
                                 parsed_cmd: vec![],
                                 source: Default::default(),
                                 interaction_input: None,
@@ -6216,7 +6389,7 @@ mod tests {
                                 process_id: None,
                                 turn_id: turn_id.clone(),
                                 command: vec!["echo".into(), "b".into()],
-                                cwd: cwd.clone().try_into()?,
+                                cwd: path_uri(cwd.clone())?,
                                 parsed_cmd: vec![],
                                 source: Default::default(),
                                 interaction_input: None,
@@ -6418,6 +6591,7 @@ mod tests {
                                         call_id: "call-id".to_string(),
                                         approval_id: Some("approval-id".to_string()),
                                         turn_id: id.to_string(),
+                                        environment_id: None,
                                         started_at_ms: 0,
                                         command: vec!["echo".to_string(), "hi".to_string()],
                                         cwd: std::env::current_dir().unwrap().try_into().unwrap(),
@@ -6584,6 +6758,34 @@ mod tests {
                     return Err(CodexErr::InternalAgentDied);
                 };
                 Ok(event)
+            })
+        }
+
+        fn ensure_goal_requested(
+            &self,
+            _goal_service: Arc<GoalService>,
+            thread_id: ThreadId,
+            objective: Option<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<ThreadGoalUpdatedEvent, CodexErr>> + Send + '_>>
+        {
+            Box::pin(async move {
+                let objective = objective.unwrap_or_else(|| "stub goal".to_string());
+                let objective = objective.trim().to_string();
+                self.requested_goals.lock().unwrap().push(objective.clone());
+                Ok(ThreadGoalUpdatedEvent {
+                    thread_id,
+                    turn_id: None,
+                    goal: ThreadGoal {
+                        thread_id,
+                        objective,
+                        status: ThreadGoalStatus::Active,
+                        token_budget: None,
+                        tokens_used: 0,
+                        time_used_seconds: 0,
+                        created_at: 1,
+                        updated_at: 1,
+                    },
+                })
             })
         }
     }
@@ -6800,7 +7002,7 @@ mod tests {
                 process_id: None,
                 turn_id: "turn-id".to_string(),
                 command: vec!["rg".to_string(), "usage".to_string()],
-                cwd: cwd.clone().try_into()?,
+                cwd: path_uri(cwd.clone())?,
                 parsed_cmd: vec![ParsedCommand::Search {
                     cmd: "rg usage ~/.codex".to_string(),
                     query: Some("usage".to_string()),
@@ -6830,7 +7032,7 @@ mod tests {
                 process_id: None,
                 turn_id: "turn-id".to_string(),
                 command: vec!["rg".to_string(), "usage".to_string()],
-                cwd: cwd.try_into()?,
+                cwd: path_uri(cwd)?,
                 parsed_cmd: vec![],
                 source: Default::default(),
                 interaction_input: None,
@@ -6933,6 +7135,7 @@ mod tests {
                 call_id: "call-id".to_string(),
                 approval_id: Some("approval-id".to_string()),
                 turn_id: "turn-id".to_string(),
+                environment_id: None,
                 started_at_ms: 0,
                 command: vec!["echo".to_string(), "hi".to_string()],
                 cwd: std::env::current_dir()?.try_into()?,
@@ -7190,6 +7393,7 @@ mod tests {
                     call_id: "call-id".to_string(),
                     approval_id: Some("approval-id".to_string()),
                     turn_id: "turn-id".to_string(),
+                    environment_id: None,
                     started_at_ms: 0,
                     command: vec!["echo".to_string(), "hi".to_string()],
                     cwd: std::env::current_dir()?.try_into()?,
@@ -7266,6 +7470,7 @@ mod tests {
                     call_id: "call-id".to_string(),
                     approval_id: Some("approval-id".to_string()),
                     turn_id: "turn-id".to_string(),
+                    environment_id: None,
                     started_at_ms: 0,
                     command: vec!["echo".to_string(), "hi".to_string()],
                     cwd: std::env::current_dir()?.try_into()?,
@@ -7353,10 +7558,12 @@ mod tests {
         let actor = ThreadActor::new(
             StubAuth,
             session_client,
+            ThreadId::default(),
             conversation.clone(),
             None,
             None,
             models_manager,
+            Arc::new(GoalService::new()),
             config,
             message_rx,
             resolution_tx,

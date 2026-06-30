@@ -19,8 +19,9 @@ use codex_core::{
     find_thread_path_by_id_str, init_state_db, resolve_installation_id, thread_store_from_config,
 };
 use codex_exec_server::{EnvironmentManager, ExecServerRuntimePaths};
-use codex_extension_api::empty_extension_registry;
+use codex_extension_api::{ExtensionEventSink, ExtensionRegistryBuilder};
 use codex_features::Feature;
+use codex_goal_extension::GoalService;
 use codex_home::CodexHomeUserInstructionsProvider;
 use codex_login::{
     CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR,
@@ -28,7 +29,7 @@ use codex_login::{
 };
 use codex_protocol::{
     ThreadId,
-    protocol::{InitialHistory, SessionSource},
+    protocol::{Event, EventMsg, InitialHistory, SessionSource},
 };
 use codex_thread_store::{
     ListThreadsParams, SortDirection as StoreSortDirection, ThreadSortKey as StoreThreadSortKey,
@@ -59,6 +60,8 @@ pub struct CodexAgent {
     config: Config,
     /// Thread manager for handling sessions
     thread_manager: Arc<ThreadManager>,
+    /// Process-scoped native Codex goal service.
+    goal_service: Arc<GoalService>,
     /// Store for listing and updating persisted thread metadata
     thread_store: Arc<dyn ThreadStore>,
     /// SQLite-backed Codex state index, when initialization succeeds
@@ -72,6 +75,28 @@ pub struct CodexAgent {
 const SESSION_LIST_PAGE_SIZE: usize = 25;
 const SESSION_TITLE_MAX_GRAPHEMES: usize = 120;
 
+struct AcpExtensionEventSink {
+    sessions: Arc<Mutex<HashMap<SessionId, Arc<Thread>>>>,
+}
+
+impl AcpExtensionEventSink {
+    fn new(sessions: Arc<Mutex<HashMap<SessionId, Arc<Thread>>>>) -> Self {
+        Self { sessions }
+    }
+}
+
+impl ExtensionEventSink for AcpExtensionEventSink {
+    fn emit(&self, event: Event) {
+        let session_id = match &event.msg {
+            EventMsg::ThreadGoalUpdated(event) => SessionId::new(event.thread_id.to_string()),
+            _ => return,
+        };
+        if let Some(thread) = self.sessions.lock().unwrap().get(&session_id).cloned() {
+            thread.emit_extension_event(event);
+        }
+    }
+}
+
 impl CodexAgent {
     /// Create a new `CodexAgent` with the given configuration
     pub async fn new(
@@ -82,6 +107,7 @@ impl CodexAgent {
 
         let client_capabilities: Arc<Mutex<ClientCapabilities>> = Arc::default();
         let session_roots: Arc<Mutex<HashMap<SessionId, PathBuf>>> = Arc::default();
+        let sessions: Arc<Mutex<HashMap<SessionId, Arc<Thread>>>> = Arc::default();
         let state_db = init_state_db(&config).await;
         let local_runtime_paths =
             ExecServerRuntimePaths::new(std::env::current_exe()?, codex_linux_sandbox_exe)?;
@@ -95,28 +121,46 @@ impl CodexAgent {
         let user_instructions_provider = Arc::new(CodexHomeUserInstructionsProvider::new(
             config.codex_home.clone(),
         ));
-        let thread_manager = Arc::new(ThreadManager::new(
-            &config,
-            auth_manager.clone(),
-            SessionSource::Unknown,
-            environment_manager,
-            empty_extension_registry(),
-            user_instructions_provider,
-            None,
-            thread_store.clone(),
-            state_db.clone(),
-            installation_id,
-            None,
-            None,
-        ));
+        let goal_service = Arc::new(GoalService::new());
+        let thread_manager = Arc::new_cyclic(|thread_manager| {
+            let mut extension_builder = ExtensionRegistryBuilder::<Config>::with_event_sink(
+                Arc::new(AcpExtensionEventSink::new(Arc::clone(&sessions))),
+            );
+            if let Some(state_db) = state_db.clone() {
+                codex_goal_extension::install_with_backend(
+                    &mut extension_builder,
+                    state_db,
+                    codex_analytics::AnalyticsEventsClient::disabled(),
+                    None,
+                    thread_manager.clone(),
+                    Arc::clone(&goal_service),
+                    |config: &Config| config.features.enabled(Feature::Goals),
+                );
+            }
+            ThreadManager::new(
+                &config,
+                auth_manager.clone(),
+                SessionSource::Unknown,
+                environment_manager,
+                Arc::new(extension_builder.build()),
+                user_instructions_provider,
+                None,
+                thread_store.clone(),
+                state_db.clone(),
+                installation_id,
+                None,
+                None,
+            )
+        });
         Ok(Self {
             auth_manager,
             client_capabilities,
             config,
             thread_manager,
+            goal_service,
             thread_store,
             state_db,
-            sessions: Arc::default(),
+            sessions,
             session_roots,
         })
     }
@@ -603,10 +647,12 @@ impl CodexAgent {
         let thread_forker: Arc<dyn ThreadForker> = self.thread_manager.clone();
         let thread = Arc::new(Thread::new(
             session_id.clone(),
+            thread_id,
             thread,
             Some(thread_forker),
             session_configured.rollout_path,
             self.auth_manager.clone(),
+            Arc::clone(&self.goal_service),
             Arc::new(self.thread_manager.get_models_manager()),
             self.client_capabilities.clone(),
             config.clone(),
@@ -709,7 +755,7 @@ impl CodexAgent {
         apply_session_meta_developer_instructions(&mut config, meta.as_ref());
 
         let NewThread {
-            thread_id: _,
+            thread_id,
             thread,
             session_configured,
         } = Box::pin(self.thread_manager.resume_thread_from_rollout(
@@ -725,10 +771,12 @@ impl CodexAgent {
         let thread_forker: Arc<dyn ThreadForker> = self.thread_manager.clone();
         let thread = Arc::new(Thread::new(
             session_id.clone(),
+            thread_id,
             thread,
             Some(thread_forker),
             session_configured.rollout_path.or(Some(rollout_path)),
             self.auth_manager.clone(),
+            Arc::clone(&self.goal_service),
             Arc::new(self.thread_manager.get_models_manager()),
             self.client_capabilities.clone(),
             config.clone(),

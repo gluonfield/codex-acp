@@ -1,6 +1,6 @@
 [package]
 name = "codex-acp"
-version = "0.16.10"
+version = "0.16.11"
 edition = "2024"
 authors = ["Zed <hi@zed.dev>", "Jaz <hello@jaz.chat>"]
 license = "Apache-2.0"
@@ -28,6 +28,8 @@ codex-core = { git = "https://github.com/openai/codex", tag = "rust-v0.142.2" }
 codex-exec-server = { git = "https://github.com/openai/codex", tag = "rust-v0.142.2" }
 codex-extension-api = { git = "https://github.com/openai/codex", tag = "rust-v0.142.2" }
 codex-features = { git = "https://github.com/openai/codex", tag = "rust-v0.142.2" }
+codex-analytics = { git = "https://github.com/openai/codex", tag = "rust-v0.142.2" }
+codex-goal-extension = { git = "https://github.com/openai/codex", tag = "rust-v0.142.2" }
 codex-home = { git = "https://github.com/openai/codex", tag = "rust-v0.142.2" }
 codex-mcp-server = { git = "https://github.com/openai/codex", tag = "rust-v0.142.2" }
 codex-models-manager = { git = "https://github.com/openai/codex", tag = "rust-v0.142.2" }
