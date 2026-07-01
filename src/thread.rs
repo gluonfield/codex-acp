@@ -12,8 +12,8 @@ use agent_client_protocol::{
     schema::{
         AgentNotification, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
         ClientCapabilities, ConfigOptionUpdate, Content, ContentBlock, ContentChunk, Diff,
-        EmbeddedResource, EmbeddedResourceResource, ImageContent, LoadSessionResponse, Meta,
-        PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
+        EmbeddedResource, EmbeddedResourceResource, ImageContent, LoadSessionResponse, MessageId,
+        Meta, PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
         PlanEntryStatus, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
         RequestPermissionResponse, ResourceLink, SelectedPermissionOutcome, SessionConfigId,
         SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
@@ -920,6 +920,16 @@ fn format_mcp_tool_approval_value(value: &serde_json::Value) -> String {
     }
 }
 
+fn codex_message_id(kind: &str, item_id: &str, index: Option<i64>) -> Option<String> {
+    if item_id.is_empty() {
+        return None;
+    }
+    Some(match index {
+        Some(index) => format!("codex:{kind}:{item_id}:{index}"),
+        None => format!("codex:{kind}:{item_id}"),
+    })
+}
+
 enum SubmissionState {
     /// User prompts, including slash commands like /init, /review, /compact.
     Prompt(PromptState),
@@ -1356,7 +1366,7 @@ impl PromptState {
             }) => {
                 info!("Agent message content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, delta: {delta:?}");
                 self.seen_message_deltas = true;
-                client.send_agent_text(delta);
+                client.send_agent_text_with_message_id(delta, codex_message_id("message", &item_id, None));
             }
             EventMsg::ReasoningContentDelta(ReasoningContentDeltaEvent {
                 thread_id,
@@ -1374,7 +1384,10 @@ impl PromptState {
             }) => {
                 info!("Agent reasoning content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, index: {index}, delta: {delta:?}");
                 self.seen_reasoning_deltas = true;
-                client.send_agent_thought(delta);
+                client.send_agent_thought_with_message_id(
+                    delta,
+                    codex_message_id("thought", &item_id, Some(index)),
+                );
             }
             EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent {
                 item_id,
@@ -1383,7 +1396,10 @@ impl PromptState {
                 info!("Agent reasoning section break received:  item_id: {item_id}, index: {summary_index}");
                 // Make sure the section heading actually get spacing
                 self.seen_reasoning_deltas = true;
-                client.send_agent_thought("\n\n");
+                client.send_agent_thought_with_message_id(
+                    "\n\n",
+                    codex_message_id("thought", &item_id, Some(summary_index)),
+                );
             }
             EventMsg::AgentMessage(AgentMessageEvent { message , phase: _, memory_citation: _ }) => {
                 info!("Agent message (non-delta) received: {message:?}");
@@ -3118,15 +3134,27 @@ impl SessionClient {
     }
 
     fn send_agent_text(&self, text: impl Into<String>) {
-        self.send_notification(SessionUpdate::AgentMessageChunk(ContentChunk::new(
-            text.into().into(),
-        )));
+        self.send_agent_text_with_message_id(text, None);
+    }
+
+    fn send_agent_text_with_message_id(&self, text: impl Into<String>, message_id: Option<String>) {
+        let chunk =
+            ContentChunk::new(text.into().into()).message_id(message_id.map(MessageId::new));
+        self.send_notification(SessionUpdate::AgentMessageChunk(chunk));
     }
 
     fn send_agent_thought(&self, text: impl Into<String>) {
-        self.send_notification(SessionUpdate::AgentThoughtChunk(ContentChunk::new(
-            text.into().into(),
-        )));
+        self.send_agent_thought_with_message_id(text, None);
+    }
+
+    fn send_agent_thought_with_message_id(
+        &self,
+        text: impl Into<String>,
+        message_id: Option<String>,
+    ) {
+        let chunk =
+            ContentChunk::new(text.into().into()).message_id(message_id.map(MessageId::new));
+        self.send_notification(SessionUpdate::AgentThoughtChunk(chunk));
     }
 
     fn send_tool_call(&self, tool_call: ToolCall) {
@@ -4455,7 +4483,9 @@ impl<A: Auth> ThreadActor<A> {
                 warn!("Received event for unknown submission ID: {id} {msg:?}");
                 return;
             };
-            warn!("Routing goal event for unknown submission ID {id} to pending prompt {prompt_id}");
+            warn!(
+                "Routing goal event for unknown submission ID {id} to pending prompt {prompt_id}"
+            );
             let Some(submission) = self.submissions.get_mut(&prompt_id) else {
                 return;
             };
@@ -5171,8 +5201,12 @@ mod tests {
                             &notification.update,
                             SessionUpdate::AgentMessageChunk(ContentChunk {
                                 content: ContentBlock::Text(TextContent { text, .. }),
+                                message_id,
                                 ..
                             }) if text == "still visible"
+                                && message_id
+                                    .as_ref()
+                                    .is_some_and(|id| id.to_string() == "codex:message:0")
                         )
                     })
                 {
