@@ -4450,7 +4450,21 @@ impl<A: Auth> ThreadActor<A> {
     async fn handle_event(&mut self, Event { id, msg }: Event) {
         if let Some(submission) = self.submissions.get_mut(&id) {
             submission.handle_event(&self.client, msg).await;
-        } else if let Some(previous_id) = sole_goal_continuation_submission_id(&self.submissions) {
+        } else if matches!(&msg, EventMsg::ThreadGoalUpdated(_)) {
+            let Some(prompt_id) = sole_pending_submission_id(&self.submissions) else {
+                warn!("Received event for unknown submission ID: {id} {msg:?}");
+                return;
+            };
+            warn!("Routing goal event for unknown submission ID {id} to pending prompt {prompt_id}");
+            let Some(submission) = self.submissions.get_mut(&prompt_id) else {
+                return;
+            };
+            submission.handle_event(&self.client, msg).await;
+        } else if matches!(&msg, EventMsg::TurnStarted(..)) {
+            let Some(previous_id) = sole_goal_continuation_submission_id(&self.submissions) else {
+                warn!("Received event for unknown submission ID: {id} {msg:?}");
+                return;
+            };
             warn!(
                 "Routing event for unknown submission ID {id} to active goal continuation {previous_id}"
             );
@@ -4463,6 +4477,17 @@ impl<A: Auth> ThreadActor<A> {
             warn!("Received event for unknown submission ID: {id} {msg:?}");
         }
     }
+}
+
+fn sole_pending_submission_id(submissions: &HashMap<String, SubmissionState>) -> Option<String> {
+    let ids = submissions
+        .iter()
+        .filter_map(|(id, submission)| submission.is_pending().then_some(id.clone()))
+        .collect::<Vec<_>>();
+    if ids.len() != 1 {
+        return None;
+    }
+    ids.into_iter().next()
 }
 
 fn sole_goal_continuation_submission_id(
@@ -6413,7 +6438,7 @@ mod tests {
                             let thread_id = ThreadId::default();
                             self.op_tx
                                 .send(Event {
-                                    id: id.to_string(),
+                                    id: "call_create_goal".to_string(),
                                     msg: EventMsg::ThreadGoalUpdated(ThreadGoalUpdatedEvent {
                                         thread_id,
                                         turn_id: Some(turn_id.clone()),
@@ -6432,7 +6457,7 @@ mod tests {
                                 .unwrap();
                             self.op_tx
                                 .send(Event {
-                                    id: id.to_string(),
+                                    id: "call_update_goal".to_string(),
                                     msg: EventMsg::ThreadGoalUpdated(ThreadGoalUpdatedEvent {
                                         thread_id,
                                         turn_id: Some(turn_id.clone()),
