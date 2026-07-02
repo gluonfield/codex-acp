@@ -920,14 +920,15 @@ fn format_mcp_tool_approval_value(value: &serde_json::Value) -> String {
     }
 }
 
-fn codex_message_id(kind: &str, item_id: &str, index: Option<i64>) -> Option<String> {
-    if item_id.is_empty() {
-        return None;
-    }
-    Some(match index {
+fn codex_message_id(kind: &str, item_id: &str, index: Option<i64>) -> String {
+    match index {
         Some(index) => format!("codex:{kind}:{item_id}:{index}"),
         None => format!("codex:{kind}:{item_id}"),
-    })
+    }
+}
+
+fn codex_replay_message_id(kind: &str, index: usize) -> String {
+    format!("codex:replay:{kind}:{index}")
 }
 
 enum SubmissionState {
@@ -1081,6 +1082,10 @@ impl PromptState {
         // Keep detached permission request tasks running so ACP can route the
         // client's required `Cancelled` response after session cancellation.
         self.pending_permission_interactions.clear();
+    }
+
+    fn event_message_id(&self, kind: &str) -> String {
+        format!("codex:{kind}:{}:{}", self.submission_id, self.event_count)
     }
 
     fn spawn_permission_request(
@@ -1366,7 +1371,7 @@ impl PromptState {
             }) => {
                 info!("Agent message content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, delta: {delta:?}");
                 self.seen_message_deltas = true;
-                client.send_agent_text_with_message_id(delta, codex_message_id("message", &item_id, None));
+                client.send_agent_text(delta, codex_message_id("message", &item_id, None));
             }
             EventMsg::ReasoningContentDelta(ReasoningContentDeltaEvent {
                 thread_id,
@@ -1384,10 +1389,7 @@ impl PromptState {
             }) => {
                 info!("Agent reasoning content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, index: {index}, delta: {delta:?}");
                 self.seen_reasoning_deltas = true;
-                client.send_agent_thought_with_message_id(
-                    delta,
-                    codex_message_id("thought", &item_id, Some(index)),
-                );
+                client.send_agent_thought(delta, codex_message_id("thought", &item_id, Some(index)));
             }
             EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent {
                 item_id,
@@ -1396,7 +1398,7 @@ impl PromptState {
                 info!("Agent reasoning section break received:  item_id: {item_id}, index: {summary_index}");
                 // Make sure the section heading actually get spacing
                 self.seen_reasoning_deltas = true;
-                client.send_agent_thought_with_message_id(
+                client.send_agent_thought(
                     "\n\n",
                     codex_message_id("thought", &item_id, Some(summary_index)),
                 );
@@ -1405,14 +1407,14 @@ impl PromptState {
                 info!("Agent message (non-delta) received: {message:?}");
                 // We didn't receive this message via streaming
                 if !std::mem::take(&mut self.seen_message_deltas) {
-                    client.send_agent_text(message);
+                    client.send_agent_text(message, self.event_message_id("message"));
                 }
             }
             EventMsg::AgentReasoning(AgentReasoningEvent { text }) => {
                 info!("Agent reasoning (non-delta) received: {text:?}");
                 // We didn't receive this message via streaming
                 if !std::mem::take(&mut self.seen_reasoning_deltas) {
-                    client.send_agent_thought(text);
+                    client.send_agent_thought(text, self.event_message_id("thought"));
                 }
             }
             EventMsg::ThreadGoalUpdated(event) => {
@@ -1421,7 +1423,7 @@ impl PromptState {
                 self.active_goal_continuation =
                     matches!(event.goal.status, ThreadGoalStatus::Active);
                 if let Some(text) = codex_extensions::format_thread_goal_update(&event) {
-                    client.send_agent_text(text);
+                    client.send_agent_text(text, self.event_message_id("thread-goal"));
                 }
             }
             EventMsg::PlanUpdate(UpdatePlanArgs { explanation, plan }) => {
@@ -1651,7 +1653,7 @@ impl PromptState {
                 warn!("Warning: {message}");
                 // Forward warnings to the client as agent messages so users see
                 // informational notices (e.g., the post-compact advisory message).
-                client.send_agent_text(message);
+                client.send_agent_text(message, self.event_message_id("warning"));
             }
             EventMsg::McpStartupUpdate(McpStartupUpdateEvent { server, status }) => {
                 info!("MCP startup update: server={server}, status={status:?}");
@@ -1681,7 +1683,10 @@ impl PromptState {
             EventMsg::ContextCompacted(..) => {
                 info!("Context compacted");
                 client.send_context_compacted();
-                client.send_agent_text("Context compacted\n".to_string());
+                client.send_agent_text(
+                    "Context compacted\n".to_string(),
+                    self.event_message_id("context-compacted"),
+                );
             }
             EventMsg::RequestPermissions(event) => {
                 info!("Request permissions: {} {}", event.call_id, event.turn_id);
@@ -1897,7 +1902,7 @@ impl PromptState {
             format_review_findings_block(&findings, None)
         };
 
-        client.send_agent_text(&text);
+        client.send_agent_text(&text, self.event_message_id("review-output"));
         Ok(())
     }
 
@@ -3133,27 +3138,15 @@ impl SessionClient {
         )));
     }
 
-    fn send_agent_text(&self, text: impl Into<String>) {
-        self.send_agent_text_with_message_id(text, None);
-    }
-
-    fn send_agent_text_with_message_id(&self, text: impl Into<String>, message_id: Option<String>) {
-        let chunk =
-            ContentChunk::new(text.into().into()).message_id(message_id.map(MessageId::new));
+    fn send_agent_text(&self, text: impl Into<String>, message_id: impl Into<String>) {
+        let chunk = ContentChunk::new(text.into().into())
+            .message_id(Some(MessageId::new(message_id.into())));
         self.send_notification(SessionUpdate::AgentMessageChunk(chunk));
     }
 
-    fn send_agent_thought(&self, text: impl Into<String>) {
-        self.send_agent_thought_with_message_id(text, None);
-    }
-
-    fn send_agent_thought_with_message_id(
-        &self,
-        text: impl Into<String>,
-        message_id: Option<String>,
-    ) {
-        let chunk =
-            ContentChunk::new(text.into().into()).message_id(message_id.map(MessageId::new));
+    fn send_agent_thought(&self, text: impl Into<String>, message_id: impl Into<String>) {
+        let chunk = ContentChunk::new(text.into().into())
+            .message_id(Some(MessageId::new(message_id.into())));
         self.send_notification(SessionUpdate::AgentThoughtChunk(chunk));
     }
 
@@ -4137,10 +4130,10 @@ impl<A: Auth> ThreadActor<A> {
     /// - `EventMsg` for user/agent messages and reasoning (like the TUI does)
     /// - `ResponseItem` for tool calls only (not persisted as EventMsg)
     fn handle_replay_history(&mut self, history: Vec<RolloutItem>) -> Result<(), Error> {
-        for item in history {
+        for (index, item) in history.into_iter().enumerate() {
             match item {
                 RolloutItem::EventMsg(event_msg) => {
-                    self.replay_event_msg(&event_msg);
+                    self.replay_event_msg(index, &event_msg);
                 }
                 RolloutItem::ResponseItem(response_item) => {
                     self.replay_response_item(&response_item);
@@ -4154,7 +4147,7 @@ impl<A: Auth> ThreadActor<A> {
 
     /// Convert and send an EventMsg as ACP notification(s) during replay.
     /// Handles messages and reasoning - mirrors the live event handling in PromptState.
-    fn replay_event_msg(&self, msg: &EventMsg) {
+    fn replay_event_msg(&self, index: usize, msg: &EventMsg) {
         match msg {
             EventMsg::UserMessage(UserMessageEvent { message, .. }) => {
                 self.client.send_user_message(message.clone());
@@ -4164,18 +4157,24 @@ impl<A: Auth> ThreadActor<A> {
                 phase: _,
                 memory_citation: _,
             }) => {
-                self.client.send_agent_text(message.clone());
+                self.client
+                    .send_agent_text(message.clone(), codex_replay_message_id("message", index));
             }
             EventMsg::AgentReasoning(AgentReasoningEvent { text }) => {
-                self.client.send_agent_thought(text.clone());
+                self.client
+                    .send_agent_thought(text.clone(), codex_replay_message_id("thought", index));
             }
             EventMsg::AgentReasoningRawContent(AgentReasoningRawContentEvent { text }) => {
-                self.client.send_agent_thought(text.clone());
+                self.client.send_agent_thought(
+                    text.clone(),
+                    codex_replay_message_id("thought-raw", index),
+                );
             }
             EventMsg::ThreadGoalUpdated(event) => {
                 self.client.send_thread_goal_update(event);
                 if let Some(text) = codex_extensions::format_thread_goal_update(event) {
-                    self.client.send_agent_text(text);
+                    self.client
+                        .send_agent_text(text, codex_replay_message_id("thread-goal", index));
                 }
             }
             // Skip other event types during replay - they either:
@@ -6212,6 +6211,37 @@ mod tests {
                 ..
             }) if text == "test delta"
         ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_chunks_always_have_message_ids() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, _handle) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["thread-goal-update".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        let notifications = client.notifications.lock().unwrap();
+        let mut agent_chunks = 0;
+        for notification in notifications.iter() {
+            match &notification.update {
+                SessionUpdate::AgentMessageChunk(chunk)
+                | SessionUpdate::AgentThoughtChunk(chunk) => {
+                    agent_chunks += 1;
+                    assert!(chunk.message_id.is_some(), "agent chunk missing messageId");
+                }
+                _ => {}
+            }
+        }
+        assert!(agent_chunks > 0);
 
         Ok(())
     }
