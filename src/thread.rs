@@ -1379,17 +1379,19 @@ impl PromptState {
                 item_id,
                 delta,
                 summary_index: index,
-            })
-            | EventMsg::ReasoningRawContentDelta(ReasoningRawContentDeltaEvent {
+            }) => {
+                info!("Agent reasoning content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, index: {index}, delta: {delta:?}");
+                self.seen_reasoning_deltas = true;
+                client.send_agent_thought(delta, codex_message_id("thought", &item_id, Some(index)));
+            }
+            EventMsg::ReasoningRawContentDelta(ReasoningRawContentDeltaEvent {
                 thread_id,
                 turn_id,
                 item_id,
                 delta,
                 content_index: index,
             }) => {
-                info!("Agent reasoning content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, index: {index}, delta: {delta:?}");
-                self.seen_reasoning_deltas = true;
-                client.send_agent_thought(delta, codex_message_id("thought", &item_id, Some(index)));
+                info!("Agent raw reasoning delta ignored: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, index: {index}, delta: {delta:?}");
             }
             EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent {
                 item_id,
@@ -1651,9 +1653,6 @@ impl PromptState {
             EventMsg::Warning(WarningEvent { message })
             | EventMsg::GuardianWarning(WarningEvent { message }) => {
                 warn!("Warning: {message}");
-                // Forward warnings to the client as agent messages so users see
-                // informational notices (e.g., the post-compact advisory message).
-                client.send_agent_text(message, self.event_message_id("warning"));
             }
             EventMsg::McpStartupUpdate(McpStartupUpdateEvent { server, status }) => {
                 info!("MCP startup update: server={server}, status={status:?}");
@@ -6216,6 +6215,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raw_reasoning_delta_does_not_duplicate_visible_thought() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, _handle) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["reasoning-delta".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        let notifications = client.notifications.lock().unwrap();
+        let thoughts = notifications
+            .iter()
+            .filter_map(|notification| match &notification.update {
+                SessionUpdate::AgentThoughtChunk(chunk) => Some(chunk),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(thoughts.len(), 1, "thoughts = {thoughts:?}");
+        assert!(matches!(
+            &thoughts[0].content,
+            ContentBlock::Text(TextContent { text, .. }) if text == "visible thought"
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn warnings_do_not_become_agent_messages() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, _handle) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["warning".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(
+            notifications.iter().all(|notification| !matches!(
+                &notification.update,
+                SessionUpdate::AgentMessageChunk(_)
+            )),
+            "warning leaked into messages: {notifications:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn agent_chunks_always_have_message_ids() -> anyhow::Result<()> {
         let (session_id, client, _, message_tx, _handle) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
@@ -6666,6 +6722,68 @@ mod tests {
                                         parsed_cmd: vec![ParsedCommand::Unknown {
                                             cmd: "echo hi".to_string(),
                                         }],
+                                    }),
+                                })
+                                .unwrap();
+                        } else if prompt == "reasoning-delta" {
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg: EventMsg::ReasoningContentDelta(
+                                        ReasoningContentDeltaEvent {
+                                            thread_id: id.to_string(),
+                                            turn_id: id.to_string(),
+                                            item_id: "rs_tmp".to_string(),
+                                            delta: "visible thought".to_string(),
+                                            summary_index: 0,
+                                        },
+                                    ),
+                                })
+                                .unwrap();
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg: EventMsg::ReasoningRawContentDelta(
+                                        ReasoningRawContentDeltaEvent {
+                                            thread_id: id.to_string(),
+                                            turn_id: id.to_string(),
+                                            item_id: "msg_tmp".to_string(),
+                                            delta: "visible thought".to_string(),
+                                            content_index: 0,
+                                        },
+                                    ),
+                                })
+                                .unwrap();
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                                        last_agent_message: None,
+                                        turn_id: id.to_string(),
+                                        completed_at: None,
+                                        duration_ms: None,
+                                        time_to_first_token_ms: None,
+                                    }),
+                                })
+                                .unwrap();
+                        } else if prompt == "warning" {
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg: EventMsg::Warning(WarningEvent {
+                                        message: "Model metadata for x not found".to_string(),
+                                    }),
+                                })
+                                .unwrap();
+                            self.op_tx
+                                .send(Event {
+                                    id: id.to_string(),
+                                    msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                                        last_agent_message: None,
+                                        turn_id: id.to_string(),
+                                        completed_at: None,
+                                        duration_ms: None,
+                                        time_to_first_token_ms: None,
                                     }),
                                 })
                                 .unwrap();
