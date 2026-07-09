@@ -16,7 +16,8 @@ use agent_client_protocol as acp;
 use codex_config::{DEFAULT_MCP_SERVER_ENVIRONMENT_ID, McpServerConfig, McpServerTransportConfig};
 use codex_core::{
     NewThread, RolloutRecorder, StateDbHandle, ThreadManager, config::Config,
-    find_thread_path_by_id_str, init_state_db, resolve_installation_id, thread_store_from_config,
+    find_thread_path_by_id_str, init_state_db, local_agent_graph_store_from_state_db,
+    resolve_installation_id, thread_store_from_config,
 };
 use codex_exec_server::{EnvironmentManager, ExecServerRuntimePaths};
 use codex_extension_api::ExtensionRegistryBuilder;
@@ -98,6 +99,7 @@ impl CodexAgent {
                 .map_err(std::io::Error::other)?,
         );
         let thread_store = thread_store_from_config(&config, state_db.clone());
+        let agent_graph_store = local_agent_graph_store_from_state_db(state_db.as_ref());
         let installation_id = resolve_installation_id(&config.codex_home).await?;
         let user_instructions_provider = Arc::new(CodexHomeUserInstructionsProvider::new(
             config.codex_home.clone(),
@@ -127,7 +129,7 @@ impl CodexAgent {
                 user_instructions_provider,
                 None,
                 thread_store.clone(),
-                state_db.clone(),
+                agent_graph_store,
                 installation_id,
                 None,
                 None,
@@ -398,6 +400,7 @@ impl CodexAgent {
                                 },
                                 env_http_headers: None,
                             },
+                            auth: Default::default(),
                             required: false,
                             enabled: true,
                             startup_timeout_sec: None,
@@ -438,6 +441,7 @@ impl CodexAgent {
                                 env_vars: vec![],
                                 cwd: Some(LegacyAppPathString::from_abs_path(&cwd)),
                             },
+                            auth: Default::default(),
                             required: false,
                             enabled: true,
                             startup_timeout_sec: None,
@@ -723,7 +727,7 @@ impl CodexAgent {
                 .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
             match &history {
-                InitialHistory::Resumed(resumed) => resumed.history.clone(),
+                InitialHistory::Resumed(resumed) => resumed.history.as_ref().clone(),
                 InitialHistory::Forked(items) => items.clone(),
                 InitialHistory::Cleared | InitialHistory::New => Vec::new(),
             }
@@ -805,7 +809,7 @@ impl CodexAgent {
                 cwd_filters: cwd.map(|cwd| vec![cwd]),
                 archived: false,
                 search_term: None,
-                parent_thread_id: None,
+                relation_filter: None,
                 use_state_db_only: false,
             })
             .await

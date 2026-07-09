@@ -28,7 +28,6 @@ use codex_apply_patch::parse_patch;
 use codex_core::{
     CodexThread, ForkSnapshot, RolloutRecorder, ThreadManager,
     config::{Config, set_project_trust_level},
-    review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
 };
 use codex_login::auth::AuthManager;
@@ -80,6 +79,7 @@ use codex_protocol::{
         RequestPermissionsResponse,
     },
     request_user_input::RequestUserInputResponse,
+    review_format::format_review_findings_block,
     user_input::UserInput,
 };
 use codex_shell_command::parse_command::parse_command;
@@ -346,25 +346,45 @@ pub trait ModelsManagerImpl: Send + Sync {
     fn get_model(
         &self,
         model_id: &Option<String>,
+        config: &Config,
     ) -> Pin<Box<dyn Future<Output = String> + Send + '_>>;
-    fn list_models(&self) -> Pin<Box<dyn Future<Output = Vec<ModelPreset>> + Send + '_>>;
+    fn list_models(
+        &self,
+        config: &Config,
+    ) -> Pin<Box<dyn Future<Output = Vec<ModelPreset>> + Send + '_>>;
 }
 
 impl ModelsManagerImpl for Arc<dyn ModelsManager> {
     fn get_model(
         &self,
         model_id: &Option<String>,
+        config: &Config,
     ) -> Pin<Box<dyn Future<Output = String> + Send + '_>> {
         let model_id = model_id.clone();
+        let http_client_factory = config.http_client_factory();
         Box::pin(async move {
-            self.get_default_model(&model_id, RefreshStrategy::OnlineIfUncached)
-                .await
+            self.get_default_model(
+                &model_id,
+                false,
+                RefreshStrategy::OnlineIfUncached,
+                http_client_factory,
+            )
+            .await
         })
     }
 
-    fn list_models(&self) -> Pin<Box<dyn Future<Output = Vec<ModelPreset>> + Send + '_>> {
+    fn list_models(
+        &self,
+        config: &Config,
+    ) -> Pin<Box<dyn Future<Output = Vec<ModelPreset>> + Send + '_>> {
+        let http_client_factory = config.http_client_factory();
         Box::pin(async move {
-            ModelsManager::list_models(self.as_ref(), RefreshStrategy::OnlineIfUncached).await
+            ModelsManager::list_models(
+                self.as_ref(),
+                RefreshStrategy::OnlineIfUncached,
+                http_client_factory,
+            )
+            .await
         })
     }
 }
@@ -1629,7 +1649,8 @@ impl PromptState {
             }
             EventMsg::ViewImageToolCall(ViewImageToolCallEvent { call_id, path }) => {
                 info!("ViewImageToolCallEvent received");
-                let display_path = path.display().to_string();
+                let display_path = path.inferred_native_path_string();
+                let location_path = path.to_path_buf();
                 client.send_notification(
                     SessionUpdate::ToolCall(
                         ToolCall::new(call_id, format!("View Image {display_path}"))
@@ -1637,7 +1658,7 @@ impl PromptState {
                             .content(vec![ToolCallContent::Content(Content::new(ContentBlock::ResourceLink(ResourceLink::new(display_path.clone(), display_path.clone())
                         )
                     )
-                )]).locations(vec![ToolCallLocation::new(path)])));
+                )]).locations(vec![ToolCallLocation::new(location_path)])));
             }
             EventMsg::EnteredReviewMode(review_request) => {
                 info!("Review begin: request={review_request:?}");
@@ -1879,7 +1900,7 @@ impl PromptState {
         client: &SessionClient,
         event: ExitedReviewModeEvent,
     ) -> Result<(), Error> {
-        let ExitedReviewModeEvent { review_output } = event;
+        let ExitedReviewModeEvent { review_output, .. } = event;
         let Some(ReviewOutputEvent {
             findings,
             overall_correctness: _,
@@ -3604,7 +3625,7 @@ impl<A: Auth> ThreadActor<A> {
             );
         }
 
-        let presets = self.models_manager.list_models().await;
+        let presets = self.models_manager.list_models(&self.config).await;
 
         let current_model = self.get_current_model().await;
         let current_preset = presets.iter().find(|p| p.model == current_model).cloned();
@@ -3716,7 +3737,7 @@ impl<A: Auth> ThreadActor<A> {
     async fn handle_set_config_model(&mut self, value: SessionConfigValueId) -> Result<(), Error> {
         let model_id = value.0;
 
-        let presets = self.models_manager.list_models().await;
+        let presets = self.models_manager.list_models(&self.config).await;
         let preset = presets.iter().find(|p| p.id.as_str() == &*model_id);
 
         let model_to_use = preset
@@ -3769,7 +3790,7 @@ impl<A: Auth> ThreadActor<A> {
             serde_json::from_value(value.0.as_ref().into()).map_err(|_| Error::invalid_params())?;
 
         let current_model = self.get_current_model().await;
-        let presets = self.models_manager.list_models().await;
+        let presets = self.models_manager.list_models(&self.config).await;
         let Some(preset) = presets.iter().find(|p| p.model == current_model) else {
             return Err(Error::invalid_params()
                 .data("Reasoning effort can only be set for known model presets"));
@@ -4085,7 +4106,9 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn get_current_model(&self) -> String {
-        self.models_manager.get_model(&self.config.model).await
+        self.models_manager
+            .get_model(&self.config.model, &self.config)
+            .await
     }
 
     async fn handle_cancel(&mut self) -> Result<(), Error> {
@@ -6330,11 +6353,15 @@ mod tests {
         fn get_model(
             &self,
             _model_id: &Option<String>,
+            _config: &Config,
         ) -> Pin<Box<dyn Future<Output = String> + Send + '_>> {
             Box::pin(async { all_model_presets()[0].to_owned().id })
         }
 
-        fn list_models(&self) -> Pin<Box<dyn Future<Output = Vec<ModelPreset>> + Send + '_>> {
+        fn list_models(
+            &self,
+            _config: &Config,
+        ) -> Pin<Box<dyn Future<Output = Vec<ModelPreset>> + Send + '_>> {
             Box::pin(async { all_model_presets().to_owned() })
         }
     }
@@ -6748,13 +6775,22 @@ mod tests {
                         self.op_tx
                             .send(Event {
                                 id: id.to_string(),
-                                msg: EventMsg::EnteredReviewMode(review_request.clone()),
+                                msg: EventMsg::EnteredReviewMode(
+                                    codex_protocol::protocol::EnteredReviewModeEvent {
+                                        target: review_request.target.clone(),
+                                        user_facing_hint: review_request.user_facing_hint.clone(),
+                                        turn_id: Some(id.to_string()),
+                                        item_id: None,
+                                    },
+                                ),
                             })
                             .unwrap();
                         self.op_tx
                             .send(Event {
                                 id: id.to_string(),
                                 msg: EventMsg::ExitedReviewMode(ExitedReviewModeEvent {
+                                    turn_id: Some(id.to_string()),
+                                    item_id: None,
                                     review_output: Some(ReviewOutputEvent {
                                         findings: vec![],
                                         overall_correctness: String::new(),
