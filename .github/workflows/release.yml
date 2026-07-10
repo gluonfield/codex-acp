@@ -208,8 +208,6 @@ jobs:
         with:
           node-version: "lts/*"
           registry-url: "https://registry.npmjs.org"
-      - name: Update npm
-        run: npm install -g npm@latest
 
       - name: Download NPM packages
         uses: actions/download-artifact@v5
@@ -242,8 +240,6 @@ jobs:
         with:
           node-version: "lts/*"
           registry-url: "https://registry.npmjs.org"
-      - name: Update npm
-        run: npm install -g npm@latest
 
       - name: Download base package
         uses: actions/download-artifact@v5
