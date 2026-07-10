@@ -78,7 +78,6 @@ echo "5. Verifying platform packages..."
 EXPECTED_PACKAGES=(
   "@jazchat/codex-acp-darwin-arm64"
   "@jazchat/codex-acp-darwin-x64"
-  "@jazchat/codex-acp-linux-arm64"
   "@jazchat/codex-acp-linux-x64"
 )
 
