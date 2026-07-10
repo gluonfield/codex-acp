@@ -3273,7 +3273,7 @@ dependencies = [
 
 [[package]]
 name = "codex-utils-pty"
-version = "0.142.2"
+version = "0.144.0"
 dependencies = [
  "anyhow",
  "filedescriptor",
