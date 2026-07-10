@@ -15,6 +15,7 @@ function getPlatformPackage() {
       x64: "codex-acp-darwin-x64",
     },
     linux: {
+      arm64: "codex-acp-linux-arm64",
       x64: "codex-acp-linux-x64",
     },
   };

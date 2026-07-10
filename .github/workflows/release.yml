@@ -49,10 +49,8 @@ jobs:
             target: x86_64-apple-darwin
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-          # Temporarily skipped for v0.16.20: the GitHub arm Linux runner
-          # failed before build while fetching apt packages from ports.ubuntu.com.
-          # - os: ubuntu-22.04-arm
-          #   target: aarch64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
           # Temporarily skipped for v0.16.20: Windows release builds currently
           # take close to an hour. Re-enable once the Windows build path is
           # cached or moved out of the critical GPT-5.6 release path.
@@ -92,8 +90,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update -y
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev
+          apt_opts=(-o Acquire::Retries=5 -o Acquire::ForceIPv4=true)
+          sudo apt-get "${apt_opts[@]}" update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get "${apt_opts[@]}" install -y --no-install-recommends pkg-config libcap-dev
 
       - name: Install bundled bwrap (Linux)
         if: ${{ runner.os == 'Linux' }}

@@ -14,6 +14,7 @@ function getPlatformPackage() {
       x64: "codex-acp-darwin-x64",
     },
     linux: {
+      arm64: "codex-acp-linux-arm64",
       x64: "codex-acp-linux-x64",
     },
   };
@@ -38,6 +39,7 @@ function testAllPlatforms() {
   const testCases = [
     { platform: "darwin", arch: "arm64", expected: "codex-acp-darwin-arm64" },
     { platform: "darwin", arch: "x64", expected: "codex-acp-darwin-x64" },
+    { platform: "linux", arch: "arm64", expected: "codex-acp-linux-arm64" },
     { platform: "linux", arch: "x64", expected: "codex-acp-linux-x64" },
   ];
 

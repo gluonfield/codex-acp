@@ -23,9 +23,7 @@ platforms=(
   "aarch64-apple-darwin|darwin|arm64"
   "x86_64-apple-darwin|darwin|x64"
   "x86_64-unknown-linux-gnu|linux|x64"
-  # Temporarily skipped for v0.16.20 while the GitHub arm Linux runner cannot
-  # fetch apt packages reliably.
-  # "aarch64-unknown-linux-gnu|linux|arm64"
+  "aarch64-unknown-linux-gnu|linux|arm64"
   # Temporarily skipped for v0.16.20 while the Windows release build is slow.
   # "aarch64-pc-windows-msvc|win32|arm64"
   # "x86_64-pc-windows-msvc|win32|x64"
