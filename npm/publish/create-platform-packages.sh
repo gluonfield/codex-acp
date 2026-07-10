@@ -24,9 +24,8 @@ platforms=(
   "x86_64-apple-darwin|darwin|x64"
   "x86_64-unknown-linux-gnu|linux|x64"
   "aarch64-unknown-linux-gnu|linux|arm64"
-  # Temporarily skipped for v0.16.20 while the Windows release build is slow.
-  # "aarch64-pc-windows-msvc|win32|arm64"
-  # "x86_64-pc-windows-msvc|win32|x64"
+  "aarch64-pc-windows-msvc|win32|arm64"
+  "x86_64-pc-windows-msvc|win32|x64"
 )
 
 for platform in "${platforms[@]}"; do
@@ -50,8 +49,9 @@ for platform in "${platforms[@]}"; do
   if [[ "$os" == "win32" ]]; then
     binary_name="codex-acp.exe"
   fi
+  host_name="codex-code-mode-host${binary_name#codex-acp}"
 
-  tar xzf "$archive_path" -C "${pkg_dir}/bin/" "$binary_name"
+  tar xzf "$archive_path" -C "${pkg_dir}/bin/" "$binary_name" "$host_name"
 
   if [[ "$os" == "linux" ]]; then
     if tar tzf "$archive_path" | grep -qx "codex-resources/bwrap"; then
@@ -64,7 +64,7 @@ for platform in "${platforms[@]}"; do
   fi
 
   if [[ "$os" != "win32" ]]; then
-    chmod +x "${pkg_dir}/bin/codex-acp"
+    chmod +x "${pkg_dir}/bin/codex-acp" "${pkg_dir}/bin/codex-code-mode-host"
   fi
 
   # Create package.json from template

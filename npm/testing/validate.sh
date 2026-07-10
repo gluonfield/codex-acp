@@ -80,6 +80,8 @@ EXPECTED_PACKAGES=(
   "@jazchat/codex-acp-darwin-x64"
   "@jazchat/codex-acp-linux-arm64"
   "@jazchat/codex-acp-linux-x64"
+  "@jazchat/codex-acp-win32-arm64"
+  "@jazchat/codex-acp-win32-x64"
 )
 
 missing_packages=0

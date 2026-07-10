@@ -51,13 +51,10 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
-          # Temporarily skipped for v0.16.20: Windows release builds currently
-          # take close to an hour. Re-enable once the Windows build path is
-          # cached or moved out of the critical GPT-5.6 release path.
-          # - os: windows-latest
-          #   target: x86_64-pc-windows-msvc
-          # - os: windows-latest
-          #   target: aarch64-pc-windows-msvc
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
 
     runs-on: ${{ matrix.os }}
 
@@ -107,6 +104,11 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Install code-mode host
+        env:
+          TARGET: ${{ matrix.target }}
+        run: bash .github/scripts/install-code-mode-host.sh
+
       - name: Code sign macOS binary
         if: startsWith(matrix.os, 'macos')
         env:
@@ -126,11 +128,12 @@ jobs:
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             BINARY_NAME="codex-acp.exe"
           fi
+          HOST_NAME="codex-code-mode-host${BINARY_NAME#codex-acp}"
           ARCHIVE_NAME="codex-acp-${{ needs.get-version.outputs.version }}-${{ matrix.target }}"
 
           cd target/${{ matrix.target }}/release
 
-          archive_items=("${BINARY_NAME}")
+          archive_items=("${BINARY_NAME}" "${HOST_NAME}")
           if [[ "${{ runner.os }}" == "Linux" ]]; then
             mkdir -p codex-resources
             cp bwrap codex-resources/bwrap
