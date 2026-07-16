@@ -370,10 +370,10 @@ impl CodexAgent {
     ) -> Result<Config, Error> {
         let mut config = self.config.clone();
         config.cwd = cwd.try_into().map_err(Error::into_internal_error)?;
-        config
-            .features
-            .enable(Feature::Goals)
-            .map_err(Error::into_internal_error)?;
+        // Goals are gated by the `features.goals` config flag. Jaz owns goals via
+        // its jaztools surface and launches Codex with `features.goals=false`;
+        // force-enabling here would silently override that flag and route goals into
+        // Codex's native store where the Jaz UI never sees them.
         let cwd = config.cwd.clone();
 
         // Propagate any client-provided MCP servers that codex-rs supports.
