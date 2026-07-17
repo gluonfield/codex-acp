@@ -1730,7 +1730,7 @@ impl PromptState {
             // we already have a way to diff the turn, so ignore
             | EventMsg::TurnDiff(..)
             | EventMsg::ThreadSettingsApplied(..)
-            // Old events
+            // Provider sub-agent updates are emitted above.
             | EventMsg::RawResponseItem(..)
             | EventMsg::SessionConfigured(..)
             | EventMsg::CollabAgentSpawnBegin(..)
@@ -1747,8 +1747,7 @@ impl PromptState {
             | EventMsg::RealtimeConversationRealtime(..)
             | EventMsg::RealtimeConversationClosed(..)
             | EventMsg::RealtimeConversationSdp(..)
-            // First-party turn-presentation/safety metadata and sub-agent
-            // activity signals with no ACP surface.
+            // First-party turn-presentation/safety metadata.
             | EventMsg::TurnModerationMetadata(..)
             | EventMsg::SafetyBuffering(..)
             | EventMsg::SubAgentActivity(..)
