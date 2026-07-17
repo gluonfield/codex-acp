@@ -1,4 +1,8 @@
-use codex_protocol::protocol::{AgentStatus, EventMsg};
+use codex_protocol::{
+    AgentPath,
+    models::ResponseItem,
+    protocol::{AgentStatus, EventMsg, SubAgentActivityKind},
+};
 use serde_json::{Value, json};
 
 pub(crate) fn provider_subagent_updates(event: &EventMsg) -> Vec<Value> {
@@ -162,6 +166,39 @@ pub(crate) fn provider_subagent_updates(event: &EventMsg) -> Vec<Value> {
             "summary": "Closed",
             "completed_at_ms": event.completed_at_ms,
         })],
+        EventMsg::SubAgentActivity(event) => {
+            let (status, summary) = match event.kind {
+                SubAgentActivityKind::Started => ("running", "Spawned"),
+                SubAgentActivityKind::Interacted => ("running", "Working"),
+                SubAgentActivityKind::Interrupted => ("cancelled", "Interrupted"),
+            };
+            let mut update = json!({
+                "provider": "codex",
+                "id": event.agent_path.as_str(),
+                "thread_id": event.agent_thread_id.to_string(),
+                "name": event.agent_path.name(),
+                "status": status,
+                "summary": summary,
+            });
+            let timestamp = match event.kind {
+                SubAgentActivityKind::Interrupted => "completed_at_ms",
+                _ => "started_at_ms",
+            };
+            update[timestamp] = json!(event.occurred_at_ms);
+            vec![update]
+        }
+        EventMsg::RawResponseItem(event) => match &event.item {
+            ResponseItem::AgentMessage {
+                author, recipient, ..
+            } if author != AgentPath::ROOT && recipient == AgentPath::ROOT => vec![json!({
+                "provider": "codex",
+                "id": author,
+                "name": author.rsplit('/').next().unwrap_or(author),
+                "status": "completed",
+                "summary": "Completed",
+            })],
+            _ => Vec::new(),
+        },
         _ => Vec::new(),
     }
 }
@@ -182,9 +219,13 @@ fn codex_agent_status(status: &AgentStatus) -> &'static str {
 mod tests {
     use super::*;
     use codex_protocol::{
-        ThreadId,
+        AgentPath, ThreadId,
+        models::{AgentMessageInputContent, ResponseItem},
         openai_models::ReasoningEffort,
-        protocol::{CollabAgentRef, CollabAgentSpawnEndEvent, CollabWaitingBeginEvent},
+        protocol::{
+            CollabAgentRef, CollabAgentSpawnEndEvent, CollabWaitingBeginEvent,
+            RawResponseItemEvent, SubAgentActivityEvent, SubAgentActivityKind,
+        },
     };
 
     fn thread_id(value: &str) -> ThreadId {
@@ -249,5 +290,85 @@ mod tests {
         assert_eq!(updates[0]["status"], "running");
         assert_eq!(updates[0]["summary"], "Waiting");
         assert_eq!(updates[0]["started_at_ms"], 7);
+    }
+
+    #[test]
+    fn maps_v2_activity_using_agent_path_as_stable_id() {
+        let child = thread_id("018f6c22-7b0a-7000-8000-000000000005");
+        let event = EventMsg::SubAgentActivity(SubAgentActivityEvent {
+            event_id: "activity-1".to_string(),
+            occurred_at_ms: 11,
+            agent_thread_id: child,
+            agent_path: AgentPath::from_string("/root/reviewer".to_string()).unwrap(),
+            kind: SubAgentActivityKind::Started,
+        });
+
+        let updates = provider_subagent_updates(&event);
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0]["id"], "/root/reviewer");
+        assert_eq!(updates[0]["thread_id"], child.to_string());
+        assert_eq!(updates[0]["name"], "reviewer");
+        assert_eq!(updates[0]["status"], "running");
+        assert_eq!(updates[0]["summary"], "Spawned");
+        assert_eq!(updates[0]["started_at_ms"], 11);
+    }
+
+    #[test]
+    fn maps_v2_interruption_to_cancelled_completion() {
+        let event = EventMsg::SubAgentActivity(SubAgentActivityEvent {
+            event_id: "activity-2".to_string(),
+            occurred_at_ms: 19,
+            agent_thread_id: thread_id("018f6c22-7b0a-7000-8000-000000000006"),
+            agent_path: AgentPath::from_string("/root/reviewer".to_string()).unwrap(),
+            kind: SubAgentActivityKind::Interrupted,
+        });
+
+        let updates = provider_subagent_updates(&event);
+
+        assert_eq!(updates[0]["status"], "cancelled");
+        assert_eq!(updates[0]["summary"], "Interrupted");
+        assert_eq!(updates[0]["completed_at_ms"], 19);
+        assert!(updates[0].get("started_at_ms").is_none());
+    }
+
+    #[test]
+    fn maps_v2_agent_message_to_completion_for_same_path() {
+        let event = EventMsg::RawResponseItem(RawResponseItemEvent {
+            item: ResponseItem::AgentMessage {
+                id: None,
+                author: "/root/reviewer".to_string(),
+                recipient: AgentPath::ROOT.to_string(),
+                content: vec![AgentMessageInputContent::InputText {
+                    text: "Review complete".to_string(),
+                }],
+                internal_chat_message_metadata_passthrough: None,
+            },
+        });
+
+        let updates = provider_subagent_updates(&event);
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0]["id"], "/root/reviewer");
+        assert_eq!(updates[0]["name"], "reviewer");
+        assert_eq!(updates[0]["status"], "completed");
+        assert_eq!(updates[0]["summary"], "Completed");
+    }
+
+    #[test]
+    fn ignores_v2_agent_messages_not_sent_to_root() {
+        let event = EventMsg::RawResponseItem(RawResponseItemEvent {
+            item: ResponseItem::AgentMessage {
+                id: None,
+                author: "/root/reviewer".to_string(),
+                recipient: "/root/implementer".to_string(),
+                content: vec![AgentMessageInputContent::InputText {
+                    text: "Peer update".to_string(),
+                }],
+                internal_chat_message_metadata_passthrough: None,
+            },
+        });
+
+        assert!(provider_subagent_updates(&event).is_empty());
     }
 }
