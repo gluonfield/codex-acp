@@ -1,6 +1,5 @@
 use codex_protocol::{
-    AgentPath,
-    models::ResponseItem,
+    models::{AgentMessageInputContent, ResponseItem, plaintext_agent_message_content},
     protocol::{AgentStatus, EventMsg, SubAgentActivityKind},
 };
 use serde_json::{Value, json};
@@ -189,8 +188,11 @@ pub(crate) fn provider_subagent_updates(event: &EventMsg) -> Vec<Value> {
         }
         EventMsg::RawResponseItem(event) => match &event.item {
             ResponseItem::AgentMessage {
-                author, recipient, ..
-            } if author != AgentPath::ROOT && recipient == AgentPath::ROOT => vec![json!({
+                author,
+                recipient,
+                content,
+                ..
+            } if is_v2_completion_message(author, recipient, content) => vec![json!({
                 "provider": "codex",
                 "id": author,
                 "name": author.rsplit('/').next().unwrap_or(author),
@@ -201,6 +203,20 @@ pub(crate) fn provider_subagent_updates(event: &EventMsg) -> Vec<Value> {
         },
         _ => Vec::new(),
     }
+}
+
+fn is_v2_completion_message(
+    author: &str,
+    recipient: &str,
+    content: &[AgentMessageInputContent],
+) -> bool {
+    let Some((parent, name)) = author.rsplit_once('/') else {
+        return false;
+    };
+    !name.is_empty()
+        && parent == recipient
+        && plaintext_agent_message_content(content)
+            .is_some_and(|text| text.starts_with("Message Type: FINAL_ANSWER\n"))
 }
 
 fn codex_agent_status(status: &AgentStatus) -> &'static str {
@@ -230,6 +246,20 @@ mod tests {
 
     fn thread_id(value: &str) -> ThreadId {
         ThreadId::from_string(value).unwrap()
+    }
+
+    fn agent_message(author: &str, recipient: &str, text: &str) -> EventMsg {
+        EventMsg::RawResponseItem(RawResponseItemEvent {
+            item: ResponseItem::AgentMessage {
+                id: None,
+                author: author.to_string(),
+                recipient: recipient.to_string(),
+                content: vec![AgentMessageInputContent::InputText {
+                    text: text.to_string(),
+                }],
+                internal_chat_message_metadata_passthrough: None,
+            },
+        })
     }
 
     #[test]
@@ -333,20 +363,12 @@ mod tests {
     }
 
     #[test]
-    fn maps_v2_agent_message_to_completion_for_same_path() {
-        let event = EventMsg::RawResponseItem(RawResponseItemEvent {
-            item: ResponseItem::AgentMessage {
-                id: None,
-                author: "/root/reviewer".to_string(),
-                recipient: AgentPath::ROOT.to_string(),
-                content: vec![AgentMessageInputContent::InputText {
-                    text: "Review complete".to_string(),
-                }],
-                internal_chat_message_metadata_passthrough: None,
-            },
-        });
-
-        let updates = provider_subagent_updates(&event);
+    fn maps_v2_final_answer_to_completion_for_same_path() {
+        let updates = provider_subagent_updates(&agent_message(
+            "/root/reviewer",
+            "/root",
+            "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/reviewer\nPayload:\nReview complete",
+        ));
 
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0]["id"], "/root/reviewer");
@@ -356,19 +378,37 @@ mod tests {
     }
 
     #[test]
-    fn ignores_v2_agent_messages_not_sent_to_root() {
-        let event = EventMsg::RawResponseItem(RawResponseItemEvent {
-            item: ResponseItem::AgentMessage {
-                id: None,
-                author: "/root/reviewer".to_string(),
-                recipient: "/root/implementer".to_string(),
-                content: vec![AgentMessageInputContent::InputText {
-                    text: "Peer update".to_string(),
-                }],
-                internal_chat_message_metadata_passthrough: None,
-            },
-        });
+    fn maps_nested_v2_final_answer_to_its_direct_parent() {
+        let updates = provider_subagent_updates(&agent_message(
+            "/root/reviewer/reader",
+            "/root/reviewer",
+            "Message Type: FINAL_ANSWER\nTask name: /root/reviewer\nSender: /root/reviewer/reader\nPayload:\nRead complete",
+        ));
 
-        assert!(provider_subagent_updates(&event).is_empty());
+        assert_eq!(updates[0]["id"], "/root/reviewer/reader");
+        assert_eq!(updates[0]["name"], "reader");
+        assert_eq!(updates[0]["status"], "completed");
+    }
+
+    #[test]
+    fn ignores_v2_nonterminal_message_to_parent() {
+        let updates = provider_subagent_updates(&agent_message(
+            "/root/reviewer",
+            "/root",
+            "Message Type: MESSAGE\nTask name: /root\nSender: /root/reviewer\nPayload:\nStill working",
+        ));
+
+        assert!(updates.is_empty());
+    }
+
+    #[test]
+    fn ignores_v2_final_answer_not_sent_to_direct_parent() {
+        let updates = provider_subagent_updates(&agent_message(
+            "/root/reviewer",
+            "/root/implementer",
+            "Message Type: FINAL_ANSWER\nTask name: /root/implementer\nSender: /root/reviewer\nPayload:\nPeer update",
+        ));
+
+        assert!(updates.is_empty());
     }
 }
