@@ -135,6 +135,9 @@ const CODEX_WORKSPACE_PROFILE_ID: &str = ":workspace";
 const CODEX_DANGER_NO_SANDBOX_PROFILE_ID: &str = ":danger-no-sandbox";
 const PLAN_MODE_ID: &str = "plan";
 const CODEX_REQUEST_USER_INPUT_META_KEY: &str = "codex.request_user_input";
+const CODEX_PLAN_KIND_META_KEY: &str = "codex.plan_kind";
+const CODEX_PLAN_KIND_PROGRESS: &str = "progress";
+const CODEX_PLAN_KIND_PROPOSAL: &str = "proposal";
 const CODEX_META_KEY: &str = "codex";
 const CODEX_SIDE_CHAT_META_KEY: &str = "sideChat";
 const SIDE_COMMAND: &str = "side";
@@ -3215,6 +3218,7 @@ impl SessionClient {
                     )
                 })
                 .collect(),
+            CODEX_PLAN_KIND_PROGRESS,
         );
     }
 
@@ -3223,15 +3227,23 @@ impl SessionClient {
         if plan_text.is_empty() {
             return;
         }
-        self.update_plan_entries(vec![PlanEntry::new(
-            plan_text.to_string(),
-            PlanEntryPriority::Medium,
-            status,
-        )]);
+        self.update_plan_entries(
+            vec![PlanEntry::new(
+                plan_text.to_string(),
+                PlanEntryPriority::Medium,
+                status,
+            )],
+            CODEX_PLAN_KIND_PROPOSAL,
+        );
     }
 
-    fn update_plan_entries(&self, entries: Vec<PlanEntry>) {
-        self.send_notification(SessionUpdate::Plan(Plan::new(entries)));
+    fn update_plan_entries(&self, entries: Vec<PlanEntry>, kind: &str) {
+        self.send_notification(SessionUpdate::Plan(Plan::new(entries).meta(
+            Meta::from_iter([(
+                CODEX_PLAN_KIND_META_KEY.to_string(),
+                serde_json::Value::String(kind.to_string()),
+            )]),
+        )));
     }
 
     async fn request_permission(
@@ -5538,6 +5550,33 @@ mod tests {
                 "trigger": "manual",
             })
         );
+    }
+
+    #[test]
+    fn plan_updates_identify_progress_and_proposals() {
+        let client = Arc::new(StubClient::new());
+        let session_client =
+            SessionClient::with_client(SessionId::new("test"), client.clone(), Arc::default());
+
+        session_client.update_plan(vec![PlanItemArg {
+            step: "Inspect the project".to_string(),
+            status: StepStatus::InProgress,
+        }]);
+        session_client
+            .update_plan_text("# Plan\n\n- Implement the fix.", PlanEntryStatus::Completed);
+
+        let notifications = client.notifications.lock().unwrap();
+        let kinds = notifications
+            .iter()
+            .map(|notification| {
+                serde_json::to_value(&notification.update).unwrap()["_meta"]
+                    [CODEX_PLAN_KIND_META_KEY]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, [CODEX_PLAN_KIND_PROGRESS, CODEX_PLAN_KIND_PROPOSAL]);
     }
 
     #[test]
