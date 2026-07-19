@@ -1377,9 +1377,7 @@ impl PromptState {
 
         let identity = match (&event, &self.thread_runtime) {
             (EventMsg::SubAgentActivity(activity), Some(runtime)) => {
-                runtime
-                    .subagent_identity(activity.agent_thread_id.clone())
-                    .await
+                runtime.subagent_identity(activity.agent_thread_id).await
             }
             _ => None,
         };
