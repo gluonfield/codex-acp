@@ -9,7 +9,7 @@ use std::{
 
 use agent_client_protocol::{
     Client, ConnectionTo, Error,
-    schema::{
+    schema::v1::{
         AgentNotification, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
         ClientCapabilities, ConfigOptionUpdate, Content, ContentBlock, ContentChunk, Diff,
         EmbeddedResource, EmbeddedResourceResource, ImageContent, LoadSessionResponse, MessageId,
@@ -93,6 +93,9 @@ use uuid::Uuid;
 
 use crate::{
     codex_extensions,
+    collab_subagents::{
+        ProviderSubagentIdentity, apply_provider_subagent_identity, provider_subagent_updates,
+    },
     developer_instructions::append_developer_instructions,
     native_goal::{NativeGoal, NativeGoalThread},
 };
@@ -276,7 +279,7 @@ pub(crate) struct ForkedThread {
     thread: Arc<dyn CodexThreadImpl>,
 }
 
-pub(crate) trait ThreadForker: Send + Sync {
+pub(crate) trait ThreadRuntime: Send + Sync {
     fn fork_side_thread(
         &self,
         config: Config,
@@ -284,9 +287,14 @@ pub(crate) trait ThreadForker: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<ForkedThread, CodexErr>> + Send + '_>>;
 
     fn remove_thread(&self, thread_id: ThreadId) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+
+    fn subagent_identity(
+        &self,
+        thread_id: ThreadId,
+    ) -> Pin<Box<dyn Future<Output = Option<ProviderSubagentIdentity>> + Send + '_>>;
 }
 
-impl ThreadForker for ThreadManager {
+impl ThreadRuntime for ThreadManager {
     fn fork_side_thread(
         &self,
         config: Config,
@@ -315,6 +323,21 @@ impl ThreadForker for ThreadManager {
     fn remove_thread(&self, thread_id: ThreadId) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             ThreadManager::remove_thread(self, &thread_id).await;
+        })
+    }
+
+    fn subagent_identity(
+        &self,
+        thread_id: ThreadId,
+    ) -> Pin<Box<dyn Future<Output = Option<ProviderSubagentIdentity>> + Send + '_>> {
+        Box::pin(async move {
+            let thread = self.get_thread(thread_id).await.ok()?;
+            let source = thread.config_snapshot().await.session_source;
+            let identity = ProviderSubagentIdentity {
+                name: source.get_nickname(),
+                role: source.get_agent_role(),
+            };
+            (identity != ProviderSubagentIdentity::default()).then_some(identity)
         })
     }
 }
@@ -464,7 +487,7 @@ impl Thread {
     pub(crate) fn new(
         session_id: SessionId,
         thread: Arc<dyn CodexThreadImpl>,
-        thread_forker: Option<Arc<dyn ThreadForker>>,
+        thread_runtime: Option<Arc<dyn ThreadRuntime>>,
         source_rollout_path: Option<PathBuf>,
         auth: Arc<AuthManager>,
         native_goal: NativeGoal,
@@ -480,7 +503,7 @@ impl Thread {
             auth,
             SessionClient::new(session_id, cx, client_capabilities),
             thread.clone(),
-            thread_forker,
+            thread_runtime,
             source_rollout_path,
             models_manager,
             native_goal,
@@ -1044,6 +1067,7 @@ struct PromptState {
     active_image_generations: HashSet<String>,
     active_guardian_assessments: HashSet<String>,
     thread: Arc<dyn CodexThreadImpl>,
+    thread_runtime: Option<Arc<dyn ThreadRuntime>>,
     resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
     pending_permission_interactions: HashMap<String, PendingPermissionInteraction>,
     next_permission_interaction_id: u64,
@@ -1069,6 +1093,7 @@ impl PromptState {
             active_image_generations: HashSet::new(),
             active_guardian_assessments: HashSet::new(),
             thread,
+            thread_runtime: None,
             resolution_tx,
             pending_permission_interactions: HashMap::new(),
             next_permission_interaction_id: 0,
@@ -1079,6 +1104,11 @@ impl PromptState {
             plan_text_by_item: HashMap::new(),
             active_goal_continuation: false,
         }
+    }
+
+    fn with_thread_runtime(mut self, thread_runtime: Option<Arc<dyn ThreadRuntime>>) -> Self {
+        self.thread_runtime = thread_runtime;
+        self
     }
 
     fn is_pending(&self) -> bool {
@@ -1345,7 +1375,18 @@ impl PromptState {
             _ => {}
         }
 
-        for subagent in crate::collab_subagents::provider_subagent_updates(&event) {
+        let identity = match (&event, &self.thread_runtime) {
+            (EventMsg::SubAgentActivity(activity), Some(runtime)) => {
+                runtime
+                    .subagent_identity(activity.agent_thread_id.clone())
+                    .await
+            }
+            _ => None,
+        };
+        for mut subagent in provider_subagent_updates(&event) {
+            if let Some(identity) = &identity {
+                apply_provider_subagent_identity(&mut subagent, identity);
+            }
             client.send_provider_subagent(subagent);
         }
 
@@ -3268,7 +3309,7 @@ struct ThreadActor<A> {
     client: SessionClient,
     /// The thread associated with this task.
     thread: Arc<dyn CodexThreadImpl>,
-    thread_forker: Option<Arc<dyn ThreadForker>>,
+    thread_runtime: Option<Arc<dyn ThreadRuntime>>,
     source_rollout_path: Option<PathBuf>,
     native_goal: NativeGoal,
     /// The configuration for the thread.
@@ -3297,7 +3338,7 @@ impl<A: Auth> ThreadActor<A> {
         auth: A,
         client: SessionClient,
         thread: Arc<dyn CodexThreadImpl>,
-        thread_forker: Option<Arc<dyn ThreadForker>>,
+        thread_runtime: Option<Arc<dyn ThreadRuntime>>,
         source_rollout_path: Option<PathBuf>,
         models_manager: Arc<dyn ModelsManagerImpl>,
         native_goal: NativeGoal,
@@ -3310,7 +3351,7 @@ impl<A: Auth> ThreadActor<A> {
             auth,
             client,
             thread,
-            thread_forker,
+            thread_runtime,
             source_rollout_path,
             native_goal,
             config,
@@ -3500,8 +3541,8 @@ impl<A: Auth> ThreadActor<A> {
                 side.thread_id
             );
         }
-        if let Some(forker) = &self.thread_forker {
-            forker.remove_thread(side.thread_id).await;
+        if let Some(runtime) = &self.thread_runtime {
+            runtime.remove_thread(side.thread_id).await;
         }
     }
 
@@ -3934,7 +3975,8 @@ impl<A: Auth> ThreadActor<A> {
             self.thread.clone(),
             self.resolution_tx.clone(),
             response_tx,
-        );
+        )
+        .with_thread_runtime(self.thread_runtime.clone());
         let state = SubmissionState::Prompt(prompt_state);
 
         self.submissions.insert(submission_id, state);
@@ -3953,8 +3995,8 @@ impl<A: Auth> ThreadActor<A> {
         let (side, new_side_thread) = if let Some(side) = self.side_threads.get(&scope.id) {
             (side.clone(), false)
         } else {
-            let forker = self
-                .thread_forker
+            let runtime = self
+                .thread_runtime
                 .clone()
                 .ok_or_else(|| Error::invalid_params().data("Side chat is unavailable"))?;
             let source_rollout_path = self
@@ -3969,7 +4011,7 @@ impl<A: Auth> ThreadActor<A> {
                 SIDE_DEVELOPER_INSTRUCTIONS,
             );
 
-            let forked = forker
+            let forked = runtime
                 .fork_side_thread(config, source_rollout_path)
                 .await
                 .map_err(|e| Error::internal_error().data(e.to_string()))?;
@@ -4029,12 +4071,15 @@ impl<A: Auth> ThreadActor<A> {
             SideSubmissionState {
                 side_chat_id: scope.id,
                 client: side_client,
-                submission: SubmissionState::Prompt(PromptState::new(
-                    submission_id.clone(),
-                    side.thread.clone(),
-                    self.resolution_tx.clone(),
-                    response_tx,
-                )),
+                submission: SubmissionState::Prompt(
+                    PromptState::new(
+                        submission_id.clone(),
+                        side.thread.clone(),
+                        self.resolution_tx.clone(),
+                        response_tx,
+                    )
+                    .with_thread_runtime(self.thread_runtime.clone()),
+                ),
             },
         );
         spawn_side_event_forwarder(submission_id, side.thread, self.resolution_tx.clone());
@@ -5048,7 +5093,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use agent_client_protocol::schema::{RequestPermissionResponse, TextContent};
+    use agent_client_protocol::schema::v1::{RequestPermissionResponse, TextContent};
     use codex_core::{config::ConfigOverrides, test_support::all_model_presets};
     use codex_goal_extension::GoalService;
     use codex_protocol::config_types::ModeKind;
@@ -6012,12 +6057,12 @@ mod tests {
     #[tokio::test]
     async fn side_prompt_uses_ephemeral_fork_with_scoped_metadata() -> anyhow::Result<()> {
         let side_thread = Arc::new(StubCodexThread::new());
-        let forker = Arc::new(StubThreadForker::new(side_thread.clone()));
-        let thread_forker: Arc<dyn ThreadForker> = forker.clone();
+        let runtime = Arc::new(StubThreadRuntime::new(side_thread.clone()));
+        let thread_runtime: Arc<dyn ThreadRuntime> = runtime.clone();
         let rollout_path = PathBuf::from("/tmp/codex-rollout.jsonl");
         let (session_id, client, main_thread, message_tx, _handle) = setup_with_config_and_forker(
             test_config().await?,
-            Some(thread_forker),
+            Some(thread_runtime),
             Some(rollout_path.clone()),
         )
         .await?;
@@ -6034,7 +6079,7 @@ mod tests {
         assert!(main_thread.ops.lock().unwrap().is_empty());
 
         {
-            let configs = forker.configs.lock().unwrap();
+            let configs = runtime.configs.lock().unwrap();
             assert_eq!(configs.len(), 1);
             assert!(configs[0].ephemeral);
             assert!(
@@ -6044,8 +6089,8 @@ mod tests {
                     .is_some_and(|instructions| instructions.contains("side conversation"))
             );
         }
-        assert_eq!(forker.paths.lock().unwrap().as_slice(), &[rollout_path]);
-        assert!(forker.removed.lock().unwrap().is_empty());
+        assert_eq!(runtime.paths.lock().unwrap().as_slice(), &[rollout_path]);
+        assert!(runtime.removed.lock().unwrap().is_empty());
 
         {
             let side_ops = side_thread.ops.lock().unwrap();
@@ -6091,7 +6136,7 @@ mod tests {
                 side.get("parentSessionId").and_then(|value| value.as_str()),
                 Some("test")
             );
-            let side_thread_id = forker.thread_id.to_string();
+            let side_thread_id = runtime.thread_id.to_string();
             assert_eq!(
                 side.get("threadId").and_then(|value| value.as_str()),
                 Some(side_thread_id.as_str())
@@ -6124,7 +6169,7 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(2), follow_response_rx).await???;
         let stop_reason = tokio::time::timeout(Duration::from_secs(2), stop_reason_rx).await???;
         assert_eq!(stop_reason, StopReason::EndTurn);
-        assert_eq!(forker.configs.lock().unwrap().len(), 1);
+        assert_eq!(runtime.configs.lock().unwrap().len(), 1);
         {
             let side_ops = side_thread.ops.lock().unwrap();
             assert!(
@@ -6143,8 +6188,8 @@ mod tests {
         })?;
         shutdown_rx.await??;
         assert_eq!(
-            forker.removed.lock().unwrap().as_slice(),
-            &[forker.thread_id]
+            runtime.removed.lock().unwrap().as_slice(),
+            &[runtime.thread_id]
         );
         drop(message_tx);
 
@@ -6154,11 +6199,11 @@ mod tests {
     #[tokio::test]
     async fn side_prompt_runs_while_main_prompt_is_open() -> anyhow::Result<()> {
         let side_thread = Arc::new(StubCodexThread::new());
-        let forker = Arc::new(StubThreadForker::new(side_thread.clone()));
-        let thread_forker: Arc<dyn ThreadForker> = forker.clone();
+        let runtime = Arc::new(StubThreadRuntime::new(side_thread.clone()));
+        let thread_runtime: Arc<dyn ThreadRuntime> = runtime.clone();
         let (session_id, _client, main_thread, message_tx, _handle) = setup_with_config_and_forker(
             test_config().await?,
-            Some(thread_forker),
+            Some(thread_runtime),
             Some(PathBuf::from("/tmp/codex-rollout.jsonl")),
         )
         .await?;
@@ -6205,7 +6250,7 @@ mod tests {
                 .is_err(),
             "side prompt should not complete the main prompt"
         );
-        assert_eq!(forker.configs.lock().unwrap().len(), 1);
+        assert_eq!(runtime.configs.lock().unwrap().len(), 1);
         {
             let main_ops = main_thread.ops.lock().unwrap();
             assert!(
@@ -6331,7 +6376,7 @@ mod tests {
 
     async fn setup_with_config_and_forker(
         config: Config,
-        thread_forker: Option<Arc<dyn ThreadForker>>,
+        thread_runtime: Option<Arc<dyn ThreadRuntime>>,
         source_rollout_path: Option<PathBuf>,
     ) -> anyhow::Result<(
         SessionId,
@@ -6353,7 +6398,7 @@ mod tests {
             StubAuth,
             session_client,
             conversation.clone(),
-            thread_forker,
+            thread_runtime,
             source_rollout_path,
             models_manager,
             NativeGoal::new(Arc::new(GoalService::new()), ThreadId::default()),
@@ -6901,7 +6946,7 @@ mod tests {
         }
     }
 
-    struct StubThreadForker {
+    struct StubThreadRuntime {
         thread_id: ThreadId,
         thread: Arc<StubCodexThread>,
         configs: std::sync::Mutex<Vec<Config>>,
@@ -6909,7 +6954,7 @@ mod tests {
         removed: std::sync::Mutex<Vec<ThreadId>>,
     }
 
-    impl StubThreadForker {
+    impl StubThreadRuntime {
         fn new(thread: Arc<StubCodexThread>) -> Self {
             Self {
                 thread_id: ThreadId::default(),
@@ -6921,7 +6966,7 @@ mod tests {
         }
     }
 
-    impl ThreadForker for StubThreadForker {
+    impl ThreadRuntime for StubThreadRuntime {
         fn fork_side_thread(
             &self,
             config: Config,
@@ -6944,6 +6989,13 @@ mod tests {
             Box::pin(async move {
                 self.removed.lock().unwrap().push(thread_id);
             })
+        }
+
+        fn subagent_identity(
+            &self,
+            _thread_id: ThreadId,
+        ) -> Pin<Box<dyn Future<Output = Option<ProviderSubagentIdentity>> + Send + '_>> {
+            Box::pin(async { None })
         }
     }
 

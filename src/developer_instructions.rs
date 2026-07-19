@@ -1,4 +1,4 @@
-use agent_client_protocol::schema::Meta;
+use agent_client_protocol::schema::v1::Meta;
 use codex_core::config::Config;
 use serde_json::Value;
 

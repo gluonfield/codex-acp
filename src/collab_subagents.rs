@@ -4,6 +4,24 @@ use codex_protocol::{
 };
 use serde_json::{Value, json};
 
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ProviderSubagentIdentity {
+    pub(crate) name: Option<String>,
+    pub(crate) role: Option<String>,
+}
+
+pub(crate) fn apply_provider_subagent_identity(
+    update: &mut Value,
+    identity: &ProviderSubagentIdentity,
+) {
+    if let Some(name) = &identity.name {
+        update["name"] = json!(name);
+    }
+    if let Some(role) = &identity.role {
+        update["role"] = json!(role);
+    }
+}
+
 pub(crate) fn provider_subagent_updates(event: &EventMsg) -> Vec<Value> {
     match event {
         EventMsg::CollabAgentSpawnEnd(event) => event
@@ -176,6 +194,7 @@ pub(crate) fn provider_subagent_updates(event: &EventMsg) -> Vec<Value> {
                 "id": event.agent_path.as_str(),
                 "thread_id": event.agent_thread_id.to_string(),
                 "name": event.agent_path.name(),
+                "task": event.agent_path.name(),
                 "status": status,
                 "summary": summary,
             });
@@ -339,9 +358,27 @@ mod tests {
         assert_eq!(updates[0]["id"], "/root/reviewer");
         assert_eq!(updates[0]["thread_id"], child.to_string());
         assert_eq!(updates[0]["name"], "reviewer");
+        assert_eq!(updates[0]["task"], "reviewer");
         assert_eq!(updates[0]["status"], "running");
         assert_eq!(updates[0]["summary"], "Spawned");
         assert_eq!(updates[0]["started_at_ms"], 11);
+    }
+
+    #[test]
+    fn applies_resolved_v2_identity_without_losing_task() {
+        let mut update = json!({"name": "reviewer", "task": "reviewer"});
+
+        apply_provider_subagent_identity(
+            &mut update,
+            &ProviderSubagentIdentity {
+                name: Some("Newton".to_string()),
+                role: Some("reviewer".to_string()),
+            },
+        );
+
+        assert_eq!(update["name"], "Newton");
+        assert_eq!(update["role"], "reviewer");
+        assert_eq!(update["task"], "reviewer");
     }
 
     #[test]

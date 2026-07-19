@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use agent_client_protocol::schema::SessionId;
+use agent_client_protocol::schema::v1::SessionId;
 use codex_core::CodexThread;
 use codex_extension_api::ExtensionEventSink;
 use codex_features::Feature;

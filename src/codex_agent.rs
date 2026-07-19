@@ -1,15 +1,18 @@
 use acp::schema::{
-    AgentAuthCapabilities, AgentCapabilities, AuthEnvVar, AuthMethod, AuthMethodAgent,
-    AuthMethodEnvVar, AuthMethodId, AuthenticateRequest, AuthenticateResponse, CancelNotification,
-    ClientCapabilities, CloseSessionRequest, CloseSessionResponse, Implementation,
-    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
-    LoadSessionRequest, LoadSessionResponse, LogoutCapabilities, LogoutRequest, LogoutResponse,
-    McpCapabilities, McpServer, McpServerHttp, McpServerStdio, Meta, NewSessionRequest,
-    NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion,
-    ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionCloseCapabilities,
-    SessionId, SessionInfo, SessionListCapabilities, SessionResumeCapabilities,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    SetSessionModeResponse,
+    ProtocolVersion,
+    v1::{
+        AgentAuthCapabilities, AgentCapabilities, AuthEnvVar, AuthMethod, AuthMethodAgent,
+        AuthMethodEnvVar, AuthMethodId, AuthenticateRequest, AuthenticateResponse,
+        CancelNotification, ClientCapabilities, CloseSessionRequest, CloseSessionResponse,
+        Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
+        ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, LogoutCapabilities,
+        LogoutRequest, LogoutResponse, McpCapabilities, McpServer, McpServerHttp, McpServerStdio,
+        Meta, NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest,
+        PromptResponse, ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities,
+        SessionCloseCapabilities, SessionId, SessionInfo, SessionListCapabilities,
+        SessionResumeCapabilities, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
+        SetSessionModeRequest, SetSessionModeResponse,
+    },
 };
 use acp::{Agent, Client, ConnectTo, ConnectionTo, Error};
 use agent_client_protocol as acp;
@@ -45,7 +48,7 @@ use std::{
 use tracing::{debug, info};
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::thread::{Thread, ThreadForker};
+use crate::thread::{Thread, ThreadRuntime};
 use crate::{
     developer_instructions::apply_session_meta_developer_instructions,
     native_goal::{NativeGoal, NativeGoalEventSink},
@@ -628,11 +631,11 @@ impl CodexAgent {
             .lock()
             .unwrap()
             .insert(session_id.clone(), config.cwd.to_path_buf());
-        let thread_forker: Arc<dyn ThreadForker> = self.thread_manager.clone();
+        let thread_runtime: Arc<dyn ThreadRuntime> = self.thread_manager.clone();
         let thread = Arc::new(Thread::new(
             session_id.clone(),
             thread,
-            Some(thread_forker),
+            Some(thread_runtime),
             session_configured.rollout_path,
             self.auth_manager.clone(),
             NativeGoal::new(Arc::clone(&self.goal_service), thread_id),
@@ -751,11 +754,11 @@ impl CodexAgent {
         .await
         .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
-        let thread_forker: Arc<dyn ThreadForker> = self.thread_manager.clone();
+        let thread_runtime: Arc<dyn ThreadRuntime> = self.thread_manager.clone();
         let thread = Arc::new(Thread::new(
             session_id.clone(),
             thread,
-            Some(thread_forker),
+            Some(thread_runtime),
             session_configured.rollout_path.or(Some(rollout_path)),
             self.auth_manager.clone(),
             NativeGoal::new(Arc::clone(&self.goal_service), thread_id),

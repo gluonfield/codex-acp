@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use agent_client_protocol::schema::{AgentNotification, ExtNotification, Meta, SessionId};
+use agent_client_protocol::schema::v1::{AgentNotification, ExtNotification, Meta, SessionId};
 use codex_protocol::protocol::{
     AdditionalContextEntry, AdditionalContextKind, Op, ThreadGoalStatus, ThreadGoalUpdatedEvent,
 };
