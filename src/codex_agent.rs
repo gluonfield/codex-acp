@@ -487,11 +487,18 @@ impl CodexAgent {
 
         *self.client_capabilities.lock().unwrap() = client_capabilities;
 
+        let auth_methods = codex_auth_methods(
+            &self.config.model_provider_id,
+            std::env::var("NO_BROWSER").is_ok(),
+        );
         let mut agent_capabilities = AgentCapabilities::new()
             .prompt_capabilities(PromptCapabilities::new().embedded_context(true).image(true))
             .mcp_capabilities(McpCapabilities::new().http(true))
-            .load_session(true)
-            .auth(AgentAuthCapabilities::new().logout(LogoutCapabilities::new()));
+            .load_session(true);
+        if !auth_methods.is_empty() {
+            agent_capabilities = agent_capabilities
+                .auth(AgentAuthCapabilities::new().logout(LogoutCapabilities::new()));
+        }
 
         agent_capabilities.session_capabilities = SessionCapabilities::new()
             .close(SessionCloseCapabilities::new())
@@ -501,16 +508,6 @@ impl CodexAgent {
             "codex".to_string(),
             serde_json::json!({ "nativeGoal": true }),
         )]));
-
-        let mut auth_methods = vec![
-            CodexAuthMethod::ChatGpt.into(),
-            CodexAuthMethod::CodexApiKey.into(),
-            CodexAuthMethod::OpenAiApiKey.into(),
-        ];
-        // Until codex device code auth works, we can't use this in remote ssh projects
-        if std::env::var("NO_BROWSER").is_ok() {
-            auth_methods.remove(0);
-        }
 
         Ok(InitializeResponse::new(protocol_version)
             .agent_capabilities(agent_capabilities)
@@ -522,6 +519,10 @@ impl CodexAgent {
         &self,
         request: AuthenticateRequest,
     ) -> Result<AuthenticateResponse, Error> {
+        if !uses_codex_auth(&self.config.model_provider_id) {
+            return Err(Error::invalid_params()
+                .data("authentication belongs to the selected model provider"));
+        }
         let auth_method = CodexAuthMethod::try_from(request.method_id)?;
 
         // Check before starting login flow if already authenticated with the same method
@@ -957,6 +958,25 @@ impl From<CodexAuthMethod> for AuthMethod {
     }
 }
 
+fn codex_auth_methods(model_provider_id: &str, no_browser: bool) -> Vec<AuthMethod> {
+    if !uses_codex_auth(model_provider_id) {
+        return Vec::new();
+    }
+    let mut methods = vec![
+        CodexAuthMethod::ChatGpt.into(),
+        CodexAuthMethod::CodexApiKey.into(),
+        CodexAuthMethod::OpenAiApiKey.into(),
+    ];
+    if no_browser {
+        methods.remove(0);
+    }
+    methods
+}
+
+fn uses_codex_auth(model_provider_id: &str) -> bool {
+    model_provider_id == "openai"
+}
+
 impl TryFrom<AuthMethodId> for CodexAuthMethod {
     type Error = Error;
 
@@ -1011,6 +1031,13 @@ fn stored_session_title(name: Option<&str>, preview: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custom_providers_do_not_offer_codex_account_auth() {
+        assert!(codex_auth_methods("openrouter", false).is_empty());
+        assert_eq!(codex_auth_methods("openai", false).len(), 3);
+        assert_eq!(codex_auth_methods("openai", true).len(), 2);
+    }
 
     #[test]
     fn stored_session_title_prefers_thread_name() {
