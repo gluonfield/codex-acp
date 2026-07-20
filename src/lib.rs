@@ -14,6 +14,7 @@ mod codex_agent;
 mod codex_extensions;
 mod collab_subagents;
 mod developer_instructions;
+mod model_metadata;
 mod native_goal;
 mod thread;
 
@@ -49,7 +50,7 @@ pub async fn run_main(
         ..ConfigOverrides::default()
     };
 
-    let config =
+    let mut config =
         Config::load_with_cli_overrides_and_harness_overrides(cli_kv_overrides, config_overrides)
             .await
             .map_err(|e| {
@@ -58,6 +59,7 @@ pub async fn run_main(
                     format!("error loading config: {e}"),
                 )
             })?;
+    model_metadata::apply_env_model_metadata(&mut config)?;
     // Apply residency requirement so the HTTP client sends the
     // x-openai-internal-codex-residency header on all requests.
     codex_login::default_client::set_default_client_residency_requirement(
