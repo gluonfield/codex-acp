@@ -4,6 +4,7 @@ use codex_models_manager::model_info::model_info_from_slug;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelVisibility;
+use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::openai_models::ReasoningEffortPreset;
 use serde::Deserialize;
@@ -28,24 +29,22 @@ struct ModelMetadata {
 
 pub(crate) fn apply_env_model_metadata(config: &mut Config) -> io::Result<()> {
     let raw = std::env::var(MODEL_METADATA_ENV).ok();
-    apply_model_metadata(config, raw.as_deref())
+    apply_model_metadata(&mut config.model_catalog, raw.as_deref())
 }
 
-fn apply_model_metadata(config: &mut Config, raw: Option<&str>) -> io::Result<()> {
+fn apply_model_metadata(catalog: &mut Option<ModelsResponse>, raw: Option<&str>) -> io::Result<()> {
     let Some(raw) = raw else {
         return Ok(());
     };
     let metadata = serde_json::from_str(raw).map_err(invalid_metadata)?;
     let model = model_info(metadata).map_err(invalid_metadata)?;
-    let mut catalog = match config.model_catalog.take() {
+    let mut next = match catalog.take() {
         Some(catalog) => catalog,
         None => bundled_models_response().map_err(invalid_metadata)?,
     };
-    catalog
-        .models
-        .retain(|candidate| candidate.slug != model.slug);
-    catalog.models.push(model);
-    config.model_catalog = Some(catalog);
+    next.models.retain(|candidate| candidate.slug != model.slug);
+    next.models.push(model);
+    *catalog = Some(next);
     Ok(())
 }
 
@@ -111,22 +110,14 @@ fn invalid_metadata(error: impl std::fmt::Display) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codex_core::config::ConfigOverrides;
 
-    #[tokio::test]
-    async fn applies_metadata_at_the_catalog_boundary() {
-        let mut config = Config::load_with_cli_overrides_and_harness_overrides(
-            vec![],
-            ConfigOverrides::default(),
-        )
-        .await
-        .expect("config should load");
-
-        config.model_catalog = None;
-        apply_model_metadata(&mut config, None).expect("missing metadata should be ignored");
-        assert!(config.model_catalog.is_none());
-        assert!(apply_model_metadata(&mut config, Some("{")).is_err());
-        assert!(config.model_catalog.is_none());
+    #[test]
+    fn applies_metadata_at_the_catalog_boundary() {
+        let mut model_catalog = None;
+        apply_model_metadata(&mut model_catalog, None).expect("missing metadata should be ignored");
+        assert!(model_catalog.is_none());
+        assert!(apply_model_metadata(&mut model_catalog, Some("{")).is_err());
+        assert!(model_catalog.is_none());
 
         let raw = r#"{
                 "id":"moonshotai/kimi-k3",
@@ -154,11 +145,11 @@ mod tests {
             .iter()
             .filter(|model| model.slug != "moonshotai/kimi-k3")
             .count();
-        config.model_catalog = Some(catalog);
+        model_catalog = Some(catalog);
 
-        apply_model_metadata(&mut config, Some(raw)).expect("metadata should merge");
+        apply_model_metadata(&mut model_catalog, Some(raw)).expect("metadata should merge");
 
-        let catalog = config.model_catalog.expect("catalog should remain present");
+        let catalog = model_catalog.expect("catalog should remain present");
         assert_eq!(catalog.models.len(), other_models + 1);
         assert!(catalog.models.contains(&preserved));
         let models = catalog
