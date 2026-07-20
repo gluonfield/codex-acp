@@ -27,10 +27,15 @@ struct ModelMetadata {
 }
 
 pub(crate) fn apply_env_model_metadata(config: &mut Config) -> io::Result<()> {
-    let Ok(raw) = std::env::var(MODEL_METADATA_ENV) else {
+    let raw = std::env::var(MODEL_METADATA_ENV).ok();
+    apply_model_metadata(config, raw.as_deref())
+}
+
+fn apply_model_metadata(config: &mut Config, raw: Option<&str>) -> io::Result<()> {
+    let Some(raw) = raw else {
         return Ok(());
     };
-    let metadata = serde_json::from_str(&raw).map_err(invalid_metadata)?;
+    let metadata = serde_json::from_str(raw).map_err(invalid_metadata)?;
     let model = model_info(metadata).map_err(invalid_metadata)?;
     let mut catalog = match config.model_catalog.take() {
         Some(catalog) => catalog,
@@ -106,11 +111,24 @@ fn invalid_metadata(error: impl std::fmt::Display) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_core::config::ConfigOverrides;
 
-    #[test]
-    fn builds_known_model_from_provider_metadata() {
-        let metadata = serde_json::from_str(
-            r#"{
+    #[tokio::test]
+    async fn applies_metadata_at_the_catalog_boundary() {
+        let mut config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await
+        .expect("config should load");
+
+        config.model_catalog = None;
+        apply_model_metadata(&mut config, None).expect("missing metadata should be ignored");
+        assert!(config.model_catalog.is_none());
+        assert!(apply_model_metadata(&mut config, Some("{")).is_err());
+        assert!(config.model_catalog.is_none());
+
+        let raw = r#"{
                 "id":"moonshotai/kimi-k3",
                 "display_name":"Kimi K3",
                 "description":"Agentic reasoning model",
@@ -118,15 +136,42 @@ mod tests {
                 "input_modalities":["text","image"],
                 "reasoning_efforts":["low","high","max"],
                 "default_reasoning_effort":"max"
-            }"#,
-        )
-        .expect("metadata should parse");
+            }"#;
+        let mut catalog = bundled_models_response().expect("bundled catalog should load");
+        let preserved = catalog
+            .models
+            .iter()
+            .find(|model| model.slug != "moonshotai/kimi-k3")
+            .expect("bundled catalog should contain another model")
+            .clone();
+        let expected_base_instructions =
+            model_info_from_slug("moonshotai/kimi-k3").base_instructions;
+        catalog
+            .models
+            .push(model_info_from_slug("moonshotai/kimi-k3"));
+        let other_models = catalog
+            .models
+            .iter()
+            .filter(|model| model.slug != "moonshotai/kimi-k3")
+            .count();
+        config.model_catalog = Some(catalog);
 
-        let model = model_info(metadata).expect("metadata should produce a model");
+        apply_model_metadata(&mut config, Some(raw)).expect("metadata should merge");
 
-        assert_eq!(model.slug, "moonshotai/kimi-k3");
+        let catalog = config.model_catalog.expect("catalog should remain present");
+        assert_eq!(catalog.models.len(), other_models + 1);
+        assert!(catalog.models.contains(&preserved));
+        let models = catalog
+            .models
+            .iter()
+            .filter(|model| model.slug == "moonshotai/kimi-k3")
+            .collect::<Vec<_>>();
+        assert_eq!(models.len(), 1);
+        let model = models[0];
+
         assert_eq!(model.context_window, Some(1_048_576));
         assert_eq!(model.max_context_window, Some(1_048_576));
+        assert_eq!(model.base_instructions, expected_base_instructions);
         assert_eq!(
             model.input_modalities,
             vec![InputModality::Text, InputModality::Image]
