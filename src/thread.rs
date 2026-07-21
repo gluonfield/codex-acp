@@ -98,6 +98,7 @@ use crate::{
     },
     developer_instructions::append_developer_instructions,
     native_goal::{NativeGoal, NativeGoalThread},
+    warning_policy::user_visible,
 };
 
 /// Abstraction over the ACP connection for sending notifications and requests
@@ -137,11 +138,11 @@ const CODEX_READ_ONLY_PROFILE_ID: &str = ":read-only";
 const CODEX_WORKSPACE_PROFILE_ID: &str = ":workspace";
 const CODEX_DANGER_NO_SANDBOX_PROFILE_ID: &str = ":danger-no-sandbox";
 const PLAN_MODE_ID: &str = "plan";
+const CODEX_META_KEY: &str = "codex";
 const CODEX_REQUEST_USER_INPUT_META_KEY: &str = "codex.request_user_input";
 const CODEX_PLAN_KIND_META_KEY: &str = "codex.plan_kind";
 const CODEX_PLAN_KIND_PROGRESS: &str = "progress";
 const CODEX_PLAN_KIND_PROPOSAL: &str = "proposal";
-const CODEX_META_KEY: &str = "codex";
 const CODEX_SIDE_CHAT_META_KEY: &str = "sideChat";
 const SIDE_COMMAND: &str = "side";
 const BTW_COMMAND: &str = "btw";
@@ -1705,12 +1706,15 @@ impl PromptState {
                     self.fail(err);
                 }
             }
-            EventMsg::Warning(WarningEvent { message })
-            | EventMsg::GuardianWarning(WarningEvent { message }) => {
+            EventMsg::Warning(WarningEvent { message }) => {
                 warn!("Warning: {message}");
-                // Forward warnings to the client as agent messages so users see
-                // informational notices (e.g., the post-compact advisory message).
-                client.send_agent_text(message, self.event_message_id("warning"));
+                if user_visible(&message) {
+                    client.send_agent_text(message, self.event_message_id("warning"));
+                }
+            }
+            EventMsg::GuardianWarning(WarningEvent { message }) => {
+                warn!("Guardian warning: {message}");
+                client.send_agent_text(message, self.event_message_id("guardian-warning"));
             }
             EventMsg::McpStartupUpdate(McpStartupUpdateEvent { server, status }) => {
                 info!("MCP startup update: server={server}, status={status:?}");
