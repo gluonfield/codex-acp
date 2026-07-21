@@ -17,6 +17,7 @@ mod developer_instructions;
 mod model_metadata;
 mod native_goal;
 mod thread;
+mod warning_policy;
 
 /// Run the Codex ACP agent.
 ///
