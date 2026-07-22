@@ -3636,15 +3636,7 @@ impl<A: Auth> ThreadActor<A> {
             mask.reasoning_effort = Some(Some(effort.clone()));
         }
 
-        let mut collaboration_mode = base.apply_mask(&mask);
-        if let Some(instructions) = self.config.developer_instructions.as_deref() {
-            collaboration_mode.settings.developer_instructions = append_developer_instructions(
-                collaboration_mode.settings.developer_instructions.take(),
-                instructions,
-            );
-        }
-
-        collaboration_mode
+        base.apply_mask(&mask)
     }
 
     async fn config_options(&self) -> Result<Vec<SessionConfigOption>, Error> {
@@ -5731,7 +5723,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_plan_mode_applies_codex_plan_collaboration_mode() -> anyhow::Result<()> {
+    async fn plan_mode_keeps_session_instructions_out_of_collaboration_mode() -> anyhow::Result<()>
+    {
         let mut config = test_config().await?;
         config.developer_instructions = Some(ACP_APPEND_TEST_INSTRUCTIONS.to_string());
         let (_session_id, _client, thread, message_tx, _handle) = setup_with_config(config).await?;
@@ -5761,13 +5754,14 @@ mod tests {
             .as_deref()
             .expect("plan mode should include developer instructions");
         assert!(instructions.contains("Plan Mode"));
-        assert!(instructions.contains(ACP_APPEND_TEST_INSTRUCTIONS));
+        assert!(!instructions.contains(ACP_APPEND_TEST_INSTRUCTIONS));
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn approval_mode_restores_default_collaboration_mode() -> anyhow::Result<()> {
+    async fn approval_mode_keeps_session_instructions_out_of_collaboration_mode()
+    -> anyhow::Result<()> {
         let mut config = test_config().await?;
         config.developer_instructions = Some(ACP_APPEND_TEST_INSTRUCTIONS.to_string());
         let (_session_id, _client, thread, message_tx, _handle) = setup_with_config(config).await?;
@@ -5802,7 +5796,7 @@ mod tests {
                     ..
                 },
             } if instructions.contains("<collaboration_mode>")
-                && instructions.contains(ACP_APPEND_TEST_INSTRUCTIONS)
+                && !instructions.contains(ACP_APPEND_TEST_INSTRUCTIONS)
         ));
 
         Ok(())
