@@ -36,7 +36,7 @@ use codex_models_manager::{
     manager::{ModelsManager, RefreshStrategy},
 };
 use codex_protocol::{
-    ThreadId,
+    ResponseItemId, ThreadId,
     approvals::{
         ElicitationRequest, ElicitationRequestEvent, GuardianAssessmentAction,
         GuardianCommandSource,
@@ -1507,13 +1507,10 @@ impl PromptState {
                 call_id,
                 query,
                 action,
+                results,
             }) => {
                 info!("Web search query received: call_id={call_id}, query={query}");
-                // Send update that the search is in progress with the query
-                // (WebSearchEnd just means we have the query, not that results are ready)
-                self.update_web_search_query(client, call_id, query, action);
-                // The actual search results will come through AgentMessage events
-                // We mark as completed when a new tool call begins
+                self.update_web_search_query(client, call_id, query, action, results);
             }
             EventMsg::ImageGenerationBegin(event) => {
                 info!("Image generation started: call_id={}", event.call_id);
@@ -1644,7 +1641,24 @@ impl PromptState {
                     client.update_plan_text(&plan_text, PlanEntryStatus::Completed);
                 }
             }
-            EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message, turn_id, completed_at: _, duration_ms: _, time_to_first_token_ms: _, }) => {
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                last_agent_message,
+                turn_id,
+                error,
+                ..
+            }) => {
+                if let Some(ErrorEvent {
+                    message,
+                    codex_error_info,
+                }) = error
+                {
+                    error!("Turn {turn_id} failed: {message} {codex_error_info:?}");
+                    self.detach_pending_interactions();
+                    self.finish(Err(Error::internal_error().data(
+                        json!({ "message": message, "codex_error_info": codex_error_info }),
+                    )));
+                    return;
+                }
                 info!(
                     "Task {turn_id} completed successfully after {} events. Last agent message: {last_agent_message:?}",
                     self.event_count
@@ -1674,7 +1688,7 @@ impl PromptState {
                 self.finish(Err(Error::internal_error()
                     .data(json!({ "message": message, "codex_error_info": codex_error_info }))));
             }
-            EventMsg::TurnAborted(TurnAbortedEvent { reason, turn_id, completed_at: _, duration_ms: _ }) => {
+            EventMsg::TurnAborted(TurnAbortedEvent { reason, turn_id, .. }) => {
                 info!("Turn {turn_id:?} aborted: {reason:?}");
                 self.detach_pending_interactions();
                 self.finish(Ok(StopReason::Cancelled));
@@ -1772,7 +1786,10 @@ impl PromptState {
             | EventMsg::ThreadSettingsApplied(..)
             // Provider sub-agent updates are emitted above.
             | EventMsg::RawResponseItem(..)
+            | EventMsg::RawResponseCompleted(..)
             | EventMsg::SessionConfigured(..)
+            | EventMsg::EnvironmentConnected(..)
+            | EventMsg::EnvironmentDisconnected(..)
             | EventMsg::CollabAgentSpawnBegin(..)
             | EventMsg::CollabAgentSpawnEnd(..)
             | EventMsg::CollabAgentInteractionBegin(..)
@@ -2154,6 +2171,11 @@ impl PromptState {
                             DynamicToolCallOutputContentItem::InputImage { image_url } => {
                                 ToolCallContent::Content(Content::new(ContentBlock::ResourceLink(
                                     ResourceLink::new(image_url.clone(), image_url),
+                                )))
+                            }
+                            DynamicToolCallOutputContentItem::InputAudio { audio_url } => {
+                                ToolCallContent::Content(Content::new(ContentBlock::ResourceLink(
+                                    ResourceLink::new(audio_url.clone(), audio_url),
                                 )))
                             }
                         })
@@ -2556,6 +2578,7 @@ impl PromptState {
         call_id: String,
         query: String,
         action: WebSearchAction,
+        results: Option<Vec<serde_json::Value>>,
     ) {
         let title = match &action {
             WebSearchAction::Search { query, queries } => queries
@@ -2584,7 +2607,8 @@ impl PromptState {
                 .raw_input(serde_json::json!({
                     "query": query,
                     "action": action
-                })),
+                }))
+                .raw_output(results.map(|results| serde_json::json!(results))),
         ));
     }
 
@@ -2833,14 +2857,16 @@ fn build_exec_permission_options(
                     },
                 }
             }
-            ReviewDecision::Denied => ExecPermissionOption {
+            ReviewDecision::Denied { rejection } => ExecPermissionOption {
                 option_id: "denied",
                 permission_option: PermissionOption::new(
                     "denied",
                     "No, continue without running it",
                     PermissionOptionKind::RejectOnce,
                 ),
-                decision: ReviewDecision::Denied,
+                decision: ReviewDecision::Denied {
+                    rejection: rejection.clone(),
+                },
             },
             ReviewDecision::Abort => ExecPermissionOption {
                 option_id: "abort",
@@ -4515,6 +4541,7 @@ impl<A: Auth> ThreadActor<A> {
             } => {
                 let id = id
                     .clone()
+                    .map(String::from)
                     .unwrap_or_else(|| generate_fallback_id("image_generation"));
                 self.client.send_tool_call(
                     ToolCall::new(id, "Image generation")
@@ -4963,16 +4990,16 @@ fn format_file_system_special(value: &FileSystemSpecialPath) -> String {
     }
 }
 
-fn format_file_system_subpath(base: &str, subpath: Option<&Path>) -> String {
+fn format_file_system_subpath(base: &str, subpath: Option<&str>) -> String {
     match subpath {
-        Some(subpath) => format!("{base}/{}", subpath.display()),
+        Some(subpath) => format!("{base}/{subpath}"),
         None => base.to_string(),
     }
 }
 
 /// Extract title and call_id from a WebSearchAction (used for replay)
 fn web_search_action_to_title_and_id(
-    id: &Option<String>,
+    id: &Option<ResponseItemId>,
     action: &codex_protocol::models::WebSearchAction,
 ) -> (String, String) {
     match action {
@@ -4983,14 +5010,16 @@ fn web_search_action_to_title_and_id(
                 .or_else(|| query.clone())
                 .unwrap_or_else(|| "Web search".to_string());
             let call_id = id
-                .clone()
+                .as_ref()
+                .map(ToString::to_string)
                 .unwrap_or_else(|| generate_fallback_id("web_search"));
             (title, call_id)
         }
         codex_protocol::models::WebSearchAction::OpenPage { url } => {
             let title = url.clone().unwrap_or_else(|| "Open page".to_string());
             let call_id = id
-                .clone()
+                .as_ref()
+                .map(ToString::to_string)
                 .unwrap_or_else(|| generate_fallback_id("web_open"));
             (title, call_id)
         }
@@ -4999,7 +5028,8 @@ fn web_search_action_to_title_and_id(
                 .clone()
                 .unwrap_or_else(|| "Find in page".to_string());
             let call_id = id
-                .clone()
+                .as_ref()
+                .map(ToString::to_string)
                 .unwrap_or_else(|| generate_fallback_id("web_find"));
             (title, call_id)
         }
@@ -5209,6 +5239,8 @@ mod tests {
             msg: EventMsg::TurnComplete(TurnCompleteEvent {
                 last_agent_message: None,
                 turn_id: "0".to_string(),
+                error: None,
+                started_at: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -5216,6 +5248,41 @@ mod tests {
         })?;
         let stop_reason = tokio::time::timeout(Duration::from_secs(2), stop_reason_rx).await???;
         assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_complete_error_fails_prompt() -> anyhow::Result<()> {
+        let (session_id, _client, thread, message_tx, _handle) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id, vec!["hold-open".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+        let stop_reason_rx =
+            tokio::time::timeout(Duration::from_secs(2), prompt_response_rx).await???;
+
+        thread.op_tx.send(Event {
+            id: "0".to_string(),
+            msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                last_agent_message: None,
+                turn_id: "0".to_string(),
+                error: Some(ErrorEvent {
+                    message: "turn failed".to_string(),
+                    codex_error_info: None,
+                }),
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        })?;
+
+        let result = tokio::time::timeout(Duration::from_secs(2), stop_reason_rx).await??;
+        assert!(result.is_err());
         drop(message_tx);
 
         Ok(())
@@ -5284,6 +5351,8 @@ mod tests {
             msg: EventMsg::TurnComplete(TurnCompleteEvent {
                 last_agent_message: None,
                 turn_id: "0".to_string(),
+                error: None,
+                started_at: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -6560,6 +6629,8 @@ mod tests {
                             send(EventMsg::TurnComplete(TurnCompleteEvent {
                                 last_agent_message: None,
                                 turn_id,
+                                error: None,
+                                started_at: None,
                                 completed_at: None,
                                 duration_ms: None,
                                 time_to_first_token_ms: None,
@@ -6589,6 +6660,8 @@ mod tests {
                             send(EventMsg::TurnComplete(TurnCompleteEvent {
                                 last_agent_message: None,
                                 turn_id,
+                                error: None,
+                                started_at: None,
                                 completed_at: None,
                                 duration_ms: None,
                                 time_to_first_token_ms: None,
@@ -6640,6 +6713,8 @@ mod tests {
                                     msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                         last_agent_message: None,
                                         turn_id,
+                                        error: None,
+                                        started_at: None,
                                         completed_at: None,
                                         duration_ms: None,
                                         time_to_first_token_ms: None,
@@ -6676,6 +6751,8 @@ mod tests {
                                     msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                         last_agent_message: None,
                                         turn_id: first_turn_id,
+                                        error: None,
+                                        started_at: None,
                                         completed_at: None,
                                         duration_ms: None,
                                         time_to_first_token_ms: None,
@@ -6732,6 +6809,8 @@ mod tests {
                                     msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                         last_agent_message: None,
                                         turn_id: continuation_turn_id,
+                                        error: None,
+                                        started_at: None,
                                         completed_at: None,
                                         duration_ms: None,
                                         time_to_first_token_ms: None,
@@ -6796,6 +6875,8 @@ mod tests {
                                     msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                         last_agent_message: None,
                                         turn_id: id.to_string(),
+                                        error: None,
+                                        started_at: None,
                                         completed_at: None,
                                         duration_ms: None,
                                         time_to_first_token_ms: None,
@@ -6833,6 +6914,8 @@ mod tests {
                                 msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                     last_agent_message: None,
                                     turn_id: id.to_string(),
+                                    error: None,
+                                    started_at: None,
                                     completed_at: None,
                                     duration_ms: None,
                                     time_to_first_token_ms: None,
@@ -6878,6 +6961,8 @@ mod tests {
                                 msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                     last_agent_message: None,
                                     turn_id: id.to_string(),
+                                    error: None,
+                                    started_at: None,
                                     completed_at: None,
                                     duration_ms: None,
                                     time_to_first_token_ms: None,
@@ -6903,6 +6988,7 @@ mod tests {
                                         turn_id: Some(active_prompt_id),
                                         reason:
                                             codex_protocol::protocol::TurnAbortReason::Interrupted,
+                                        started_at: None,
                                         completed_at: None,
                                         duration_ms: None,
                                     }),
@@ -7303,7 +7389,10 @@ mod tests {
                 proposed_execpolicy_amendment: None,
                 proposed_network_policy_amendments: None,
                 additional_permissions: None,
-                available_decisions: Some(vec![ReviewDecision::Approved, ReviewDecision::Denied]),
+                available_decisions: Some(vec![
+                    ReviewDecision::Approved,
+                    ReviewDecision::denied("denied"),
+                ]),
                 parsed_cmd: vec![ParsedCommand::Unknown {
                     cmd: "echo hi".to_string(),
                 }],
@@ -7344,7 +7433,7 @@ mod tests {
             Some(Op::ExecApproval {
                 id,
                 turn_id,
-                decision: ReviewDecision::Denied,
+                decision: ReviewDecision::Denied { .. },
             }) if id == "approval-id" && turn_id.as_deref() == Some("turn-id")
         ));
 

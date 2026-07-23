@@ -18,9 +18,9 @@ use acp::{Agent, Client, ConnectTo, ConnectionTo, Error};
 use agent_client_protocol as acp;
 use codex_config::{DEFAULT_MCP_SERVER_ENVIRONMENT_ID, McpServerConfig, McpServerTransportConfig};
 use codex_core::{
-    NewThread, RolloutRecorder, StateDbHandle, ThreadManager, config::Config,
-    find_thread_path_by_id_str, init_state_db, local_agent_graph_store_from_state_db,
-    resolve_installation_id, thread_store_from_config,
+    CodexAppsToolsCache, NewThread, RolloutRecorder, StateDbHandle, ThreadManager,
+    build_models_manager, config::Config, find_thread_path_by_id_str, init_state_db,
+    local_agent_graph_store_from_state_db, resolve_installation_id, thread_store_from_config,
 };
 use codex_exec_server::{EnvironmentManager, ExecServerRuntimePaths};
 use codex_extension_api::ExtensionRegistryBuilder;
@@ -82,6 +82,16 @@ pub struct CodexAgent {
 const SESSION_LIST_PAGE_SIZE: usize = 25;
 const SESSION_TITLE_MAX_GRAPHEMES: usize = 120;
 
+fn install_native_tool_extensions(
+    builder: &mut ExtensionRegistryBuilder<Config>,
+    auth_manager: Arc<AuthManager>,
+) {
+    codex_web_search_extension::install(builder, auth_manager.clone());
+    codex_image_generation_extension::install(builder, auth_manager, |config: &Config| {
+        Some(config.codex_home.clone())
+    });
+}
+
 impl CodexAgent {
     /// Create a new `CodexAgent` with the given configuration
     pub async fn new(
@@ -112,6 +122,7 @@ impl CodexAgent {
             let mut extension_builder = ExtensionRegistryBuilder::<Config>::with_event_sink(
                 Arc::new(NativeGoalEventSink::new(Arc::clone(&sessions))),
             );
+            install_native_tool_extensions(&mut extension_builder, auth_manager.clone());
             if let Some(state_db) = state_db.clone() {
                 codex_goal_extension::install_with_backend(
                     &mut extension_builder,
@@ -126,6 +137,8 @@ impl CodexAgent {
             ThreadManager::new(
                 &config,
                 auth_manager.clone(),
+                build_models_manager(&config, auth_manager.clone()),
+                CodexAppsToolsCache::default(),
                 SessionSource::Unknown,
                 environment_manager,
                 Arc::new(extension_builder.build()),
@@ -1030,7 +1043,51 @@ fn stored_session_title(name: Option<&str>, preview: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use codex_core::config::ConfigBuilder;
+    use codex_extension_api::{ExtensionData, ThreadStartInput, ToolName};
+    use codex_protocol::protocol::SessionSource;
+    use tempfile::TempDir;
+
     use super::*;
+
+    #[tokio::test]
+    async fn native_web_and_image_tools_are_installed() -> anyhow::Result<()> {
+        let codex_home = TempDir::new()?;
+        let config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await?;
+        let auth_manager = AuthManager::shared_from_config(&config, false).await;
+        let mut builder = ExtensionRegistryBuilder::new();
+        install_native_tool_extensions(&mut builder, auth_manager);
+        let registry = builder.build();
+        let session_store = ExtensionData::new("session");
+        let thread_store = ExtensionData::new("thread");
+
+        for contributor in registry.thread_lifecycle_contributors() {
+            contributor
+                .on_thread_start(ThreadStartInput {
+                    config: &config,
+                    session_source: &SessionSource::Unknown,
+                    persistent_thread_state_available: false,
+                    environments: &[],
+                    session_store: &session_store,
+                    thread_store: &thread_store,
+                })
+                .await;
+        }
+
+        let tools = registry
+            .tool_contributors()
+            .iter()
+            .flat_map(|contributor| contributor.tools(&session_store, &thread_store))
+            .map(|tool| tool.tool_name())
+            .collect::<Vec<_>>();
+        assert!(tools.contains(&ToolName::namespaced("web", "run")));
+        assert!(tools.contains(&ToolName::namespaced("image_gen", "imagegen")));
+
+        Ok(())
+    }
 
     #[test]
     fn custom_providers_do_not_offer_codex_account_auth() {

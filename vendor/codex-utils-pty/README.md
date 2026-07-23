@@ -4,9 +4,9 @@ Lightweight helpers for spawning interactive processes either under a PTY (pseud
 
 ## API surface
 
-- `spawn_pty_process(program, args, cwd, env, arg0, size)` → `SpawnedProcess`
-- `spawn_pipe_process(program, args, cwd, env, arg0)` → `SpawnedProcess`
-- `spawn_pipe_process_no_stdin(program, args, cwd, env, arg0)` → `SpawnedProcess`
+- `spawn_pty_process(program, args, cwd, env, arg0, size, inherited_fds)` → `SpawnedProcess`
+- `spawn_pipe_process(program, args, cwd, env, arg0, inherited_fds)` → `SpawnedProcess`
+- `spawn_pipe_process_no_stdin(program, args, cwd, env, arg0, inherited_fds)` → `SpawnedProcess`
 - `combine_output_receivers(stdout_rx, stderr_rx)` → `broadcast::Receiver<Vec<u8>>`
 - `conpty_supported()` → `bool` (Windows only; always true elsewhere)
 - `TerminalSize { rows, cols }` selects PTY dimensions in character cells.
@@ -35,6 +35,7 @@ let spawned = spawn_pty_process(
     &env_map,
     &None,
     TerminalSize::default(),
+    &[],
 ).await?;
 
 let writer = spawned.session.writer_sender();
